@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>biy</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="xterm.css">
+</head>
+<body>
+  <!-- 사이드바 -->
+  <aside id="sidebar" class="sidebar">
+    <!-- 사이드바 탭 -->
+    <div class="sidebar-tabs">
+      <button class="sidebar-tab active" data-tab="sessions">세션</button>
+      <button class="sidebar-tab" data-tab="servers">SSH 서버</button>
+    </div>
+
+    <!-- 세션 패널 -->
+    <div id="panel-sessions" class="sidebar-panel active">
+      <div id="session-list" class="sidebar-panel-content"></div>
+    </div>
+
+    <!-- 전송 상태 -->
+    <div id="transfer-bar" class="transfer-bar hidden"></div>
+
+    <!-- 서버 패널 -->
+    <div id="panel-servers" class="sidebar-panel">
+      <div class="sidebar-panel-header">
+        <span>저장된 서버</span>
+        <button id="sidebar-add-btn" class="sidebar-icon-btn" title="설정에서 추가 (⌘,)">+</button>
+      </div>
+      <div id="ssh-list" class="sidebar-panel-content"></div>
+    </div>
+  </aside>
+
+  <!-- 사이드바 리사이즈 핸들 -->
+  <div id="sidebar-resize" class="sidebar-resize"></div>
+
+  <!-- 메인 영역 -->
+  <main id="main">
+    <!-- 탭바 -->
+    <div id="tabbar" class="tabbar">
+      <button id="sidebar-toggle-btn" class="toolbar-btn" title="사이드바 (⌘B)">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+          <rect x="1" y="2" width="5" height="12" rx="1" opacity="0.6"/>
+          <rect x="7" y="2" width="8" height="12" rx="1" opacity="0.3"/>
+        </svg>
+      </button>
+      <div class="tabbar-divider"></div>
+      <div id="tab-list" class="tab-list"></div>
+      <button id="new-tab-btn" class="tab-add-btn" title="새 탭 (⌘T)">+</button>
+      <div class="toolbar-right">
+        <button id="settings-btn" class="toolbar-btn" title="설정 (⌘,)">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M8 10a2 2 0 100-4 2 2 0 000 4z"/>
+            <path fill-rule="evenodd" d="M6.5 1a.5.5 0 00-.5.5v.7a5.5 5.5 0 00-1.6.9l-.6-.3a.5.5 0 00-.7.2l-1 1.7a.5.5 0 00.2.7l.6.3a5.5 5.5 0 000 1.8l-.6.3a.5.5 0 00-.2.7l1 1.7a.5.5 0 00.7.2l.6-.3a5.5 5.5 0 001.6.9v.7a.5.5 0 00.5.5h2a.5.5 0 00.5-.5v-.7a5.5 5.5 0 001.6-.9l.6.3a.5.5 0 00.7-.2l1-1.7a.5.5 0 00-.2-.7l-.6-.3a5.5 5.5 0 000-1.8l.6-.3a.5.5 0 00.2-.7l-1-1.7a.5.5 0 00-.7-.2l-.6.3A5.5 5.5 0 009 2.2v-.7a.5.5 0 00-.5-.5h-2zM8 11a3 3 0 100-6 3 3 0 000 6z"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- 검색 바 -->
+    <div id="search-bar" class="search-bar hidden">
+      <input id="search-input" type="text" placeholder="검색...">
+      <button id="search-prev" class="search-btn" title="이전 (⇧Enter)">↑</button>
+      <button id="search-next" class="search-btn" title="다음 (Enter)">↓</button>
+      <button id="search-close" class="search-btn" title="닫기 (Esc)">×</button>
+    </div>
+
+    <div id="terminal-container"></div>
+
+  </main>
+
+  <!-- 컨텍스트 메뉴 -->
+  <div id="context-menu" class="context-menu hidden">
+    <button class="context-item" data-action="download">다운로드</button>
+    <button class="context-item" data-action="rename">이름 변경</button>
+    <button class="context-item" data-action="delete">삭제</button>
+    <div class="context-divider"></div>
+    <button class="context-item" data-action="copy-path">경로 복사</button>
+  </div>
+
+  <!-- 탭 우클릭 메뉴 -->
+  <div id="tab-context-menu" class="context-menu hidden">
+    <button class="context-item" data-action="split-h">좌우 분할</button>
+    <button class="context-item" data-action="split-v">상하 분할</button>
+    <div class="context-divider"></div>
+    <button class="context-item" data-action="close">탭 닫기</button>
+  </div>
+
+  <!-- 설정 모달 -->
+  <div id="settings-modal" class="modal-overlay hidden">
+    <div class="modal" style="width:520px">
+      <div class="modal-header">
+        <span>설정</span>
+        <button id="settings-modal-close" class="modal-close">×</button>
+      </div>
+      <div class="modal-body">
+        <!-- 테마 -->
+        <div class="settings-section-title">테마</div>
+        <div id="theme-grid" class="theme-grid"></div>
+
+        <!-- 글꼴 -->
+        <div class="settings-section-title">글꼴</div>
+        <div class="modal-field">
+          <label>크기</label>
+          <div class="settings-slider-row">
+            <input id="settings-fontsize" type="range" min="10" max="24" step="1" value="14">
+            <span id="settings-fontsize-label">14px</span>
+          </div>
+        </div>
+
+        <!-- 커서 -->
+        <div class="settings-section-title">커서</div>
+        <div class="modal-field">
+          <label>스타일</label>
+          <div class="modal-auth-tabs">
+            <button class="cursor-tab active" data-cursor="bar">Bar</button>
+            <button class="cursor-tab" data-cursor="block">Block</button>
+            <button class="cursor-tab" data-cursor="underline">Underline</button>
+          </div>
+        </div>
+
+        <!-- 스크롤백 -->
+        <div class="settings-section-title">스크롤백</div>
+        <div class="modal-row">
+          <div class="modal-field">
+            <label>히스토리 줄 수</label>
+            <input id="settings-scrollback" type="number" value="10000" min="100" max="100000">
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <div style="flex:1"></div>
+        <button id="settings-modal-cancel" class="modal-btn">닫기</button>
+        <button id="settings-modal-save" class="modal-btn modal-btn-primary">저장</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- SSH 연결 추가/편집 모달 -->
+  <div id="ssh-modal" class="modal-overlay hidden">
+    <div class="modal">
+      <div class="modal-header">
+        <span id="ssh-modal-title">새 SSH 연결</span>
+        <button id="ssh-modal-close" class="modal-close">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-field">
+          <label>이름</label>
+          <input id="ssh-name" type="text" placeholder="내 서버">
+        </div>
+        <div class="modal-field">
+          <label>호스트</label>
+          <input id="ssh-host" type="text" placeholder="example.com">
+        </div>
+        <div class="modal-row">
+          <div class="modal-field">
+            <label>포트</label>
+            <input id="ssh-port" type="number" value="22">
+          </div>
+          <div class="modal-field" style="flex:2">
+            <label>사용자</label>
+            <input id="ssh-user" type="text" placeholder="root">
+          </div>
+        </div>
+        <div class="modal-field">
+          <label>인증 방식</label>
+          <div class="modal-auth-tabs">
+            <button class="modal-auth-tab active" data-auth="agent">SSH Agent</button>
+            <button class="modal-auth-tab" data-auth="key">키 파일</button>
+            <button class="modal-auth-tab" data-auth="password">비밀번호</button>
+          </div>
+        </div>
+        <div id="ssh-key-field" class="modal-field hidden">
+          <label>키 파일 경로</label>
+          <input id="ssh-keypath" type="text" placeholder="~/.ssh/id_rsa">
+        </div>
+        <div id="ssh-password-field" class="modal-field hidden">
+          <label>비밀번호</label>
+          <input id="ssh-password" type="password" placeholder="비밀번호 입력">
+          <span class="modal-hint">macOS 키체인에 안전하게 저장됩니다</span>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="ssh-modal-delete" class="modal-btn modal-btn-danger hidden">삭제</button>
+        <div style="flex:1"></div>
+        <button id="ssh-modal-cancel" class="modal-btn">취소</button>
+        <button id="ssh-modal-save" class="modal-btn modal-btn-primary">저장</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>

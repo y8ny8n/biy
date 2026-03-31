@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+dist/
+
+# Rust
+src-tauri/target/
+
+# SwiftUI
+biy-settings/.build/
+
+# macOS
+.DS_Store
+*.swp
+
+# IDE
+.vscode/
+.idea/
