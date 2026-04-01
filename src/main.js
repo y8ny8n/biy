@@ -132,6 +132,13 @@ async function createTab(type = 'local', sshConfig = null) {
         return;
       }
 
+      // 붙여넣기 → xterm onData에서 처리하므로 여기서는 무시 (2중 전송 방지)
+      if (e.inputType === 'insertFromPaste') {
+        e.stopPropagation();
+        xtermTextarea.value = '';
+        return;
+      }
+
       // 일반 텍스트 입력 (영문, 숫자, 기호 등) → 직접 PTY 전송
       if (e.data) {
         e.stopPropagation();
@@ -148,6 +155,12 @@ async function createTab(type = 'local', sshConfig = null) {
   term.attachCustomKeyEventHandler((e) => {
     if (e.type !== 'keydown') return true;
     if (e.isComposing || e.keyCode === 229 || _imeComposing) return false;
+    // Shift+Enter → 개행 (쉘 멀티라인 입력)
+    if (e.shiftKey && e.key === 'Enter') {
+      e.preventDefault();
+      invoke('pty_write', { id, data: '\n' });
+      return false;
+    }
     if (e.ctrlKey || e.metaKey || e.altKey) return true;
     if (e.key.length > 1) return true; // Enter, Backspace, Arrow, F1~F12 등
     return false; // 인쇄 가능 문자 차단 → input 이벤트로 처리
@@ -162,6 +175,7 @@ async function createTab(type = 'local', sshConfig = null) {
     term,
     fitAddon,
     searchAddon,
+    webglAddon,
     container,
     ptyId: null,
     alive: true,
@@ -246,6 +260,17 @@ function switchTab(id) {
     if (tab.id === id) {
       setTimeout(() => {
         tab.fitAddon.fit();
+        // WebGL 컨텍스트 복구: display:none → block 전환 시 글리프 깨짐 방지
+        try {
+          tab.term.refresh(0, tab.term.rows - 1);
+        } catch (e) {
+          // WebGL context lost → addon 재로드
+          if (tab.webglAddon) {
+            tab.webglAddon.dispose();
+            tab.webglAddon = new WebglAddon();
+            tab.term.loadAddon(tab.webglAddon);
+          }
+        }
         tab.term.focus();
         tab.term.scrollToBottom();
       }, 50);
