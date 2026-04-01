@@ -6,6 +6,13 @@ import { SearchAddon } from '@xterm/addon-search';
 
 let invoke, listen, getCurrentWindow;
 
+// HTML escape (XSS 방지)
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
 // Tauri API 초기화
 try {
   invoke = window.__TAURI__.core.invoke;
@@ -286,7 +293,7 @@ function renderTabBar() {
     const icon = tab.type === 'ssh' ? '🌐' : '⌘';
     el.innerHTML = `
       <span class="tab-icon">${icon}</span>
-      <span class="tab-title">${tab.title}</span>
+      <span class="tab-title">${escapeHtml(tab.title)}</span>
       <button class="tab-close" title="닫기">×</button>
     `;
 
@@ -431,7 +438,7 @@ function renderFileTree(tabId, type, cwd, files) {
     <button class="file-tree-up" title="상위 폴더">↑</button>
     <button class="file-tree-refresh" title="새로고침">↻</button>
     <button class="file-tree-hidden ${showHiddenFiles ? 'active' : ''}" title="숨김 파일 표시">.*</button>
-    <span class="file-tree-cwd" title="${cwd}">${cwd}</span>
+    <span class="file-tree-cwd" title="${escapeHtml(cwd)}">${escapeHtml(cwd)}</span>
     <button class="file-tree-cd" title="터미널에서 이 경로로 이동">cd</button>
   `;
 
@@ -466,8 +473,9 @@ function renderFileTree(tabId, type, cwd, files) {
   pathBar.querySelector('.file-tree-cd').addEventListener('click', () => {
     const tab = tabs.find(t => t.id === tabId);
     if (tab && tab.alive) {
-      // Ctrl+U로 현재 입력 지우고 cd 전송
-      invoke('pty_write', { id: tabId, data: `\x15cd "${cwd}"\r` });
+      // Ctrl+U로 현재 입력 지우고 cd 전송 (쉘 특수문자 escape)
+      const safeCwd = cwd.replace(/([\\\"$`!])/g, '\\$1');
+      invoke('pty_write', { id: tabId, data: `\x15cd "${safeCwd}"\r` });
     }
   });
   pathBar.querySelector('.file-tree-up').addEventListener('click', () => {
@@ -487,7 +495,7 @@ function renderFileTree(tabId, type, cwd, files) {
     if (file.is_dir) {
       el.innerHTML = `
         <span class="file-tree-icon">📁</span>
-        <span class="file-tree-name">${file.name}</span>
+        <span class="file-tree-name">${escapeHtml(file.name)}</span>
       `;
       el.addEventListener('dblclick', () => {
         if (type === 'ssh') loadRemoteFiles(tabId, file.path);
@@ -496,7 +504,7 @@ function renderFileTree(tabId, type, cwd, files) {
     } else {
       el.innerHTML = `
         <span class="file-tree-icon">📄</span>
-        <span class="file-tree-name">${file.name}</span>
+        <span class="file-tree-name">${escapeHtml(file.name)}</span>
         <span class="file-tree-size">${formatSize(file.size)}</span>
         <button class="file-tree-download" title="다운로드">↓</button>
       `;
@@ -722,9 +730,9 @@ async function loadSshList() {
           <div class="ssh-item-info">
             <div class="ssh-item-name">
               <span class="ssh-item-dot ${isConnected ? 'connected' : ''}"></span>
-              ${conn.name || conn.host}
+              ${escapeHtml(conn.name || conn.host)}
             </div>
-            <div class="ssh-item-host">${conn.username}@${conn.host}:${conn.port}</div>
+            <div class="ssh-item-host">${escapeHtml(conn.username)}@${escapeHtml(conn.host)}:${conn.port}</div>
           </div>
           <div class="ssh-item-actions">
             <button class="ssh-item-btn ssh-item-connect" title="연결">연결</button>
@@ -922,7 +930,7 @@ listen('transfer-progress', (event) => {
 });
 
 listen('transfer-complete', (event) => {
-  const { type, name } = event.payload;
+  const { type, name, tabId } = event.payload;
   const label = type === 'download' ? '다운로드' : '업로드';
   showToast(`${label} 완료: ${name}`);
 
@@ -939,12 +947,12 @@ listen('transfer-complete', (event) => {
     }, 3000);
   }
 
-  // 업로드 완료 시 파일 트리 새로고침
-  if (type === 'upload') {
-    const activeTab = tabs.find(t => t.id === currentTabId);
-    if (activeTab && activeTab.sftpCwd) {
-      if (activeTab.type === 'ssh') loadRemoteFiles(currentTabId, activeTab.sftpCwd);
-      else loadLocalFiles(currentTabId, activeTab.sftpCwd);
+  // 업로드 완료 시 해당 탭의 파일 트리 새로고침
+  if (type === 'upload' && tabId != null) {
+    const uploadTab = tabs.find(t => t.id === tabId);
+    if (uploadTab && uploadTab.sftpCwd) {
+      if (uploadTab.type === 'ssh') loadRemoteFiles(tabId, uploadTab.sftpCwd);
+      else loadLocalFiles(tabId, uploadTab.sftpCwd);
     }
   }
 });

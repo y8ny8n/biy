@@ -448,9 +448,12 @@ fn keychain_save_password(host: &str, username: &str, password: &str) {
 }
 
 fn prompt_password(host: &str, username: &str) -> Option<String> {
+    // AppleScript injection 방지: 큰따옴표와 백슬래시 escape
+    let safe_user = username.replace('\\', "\\\\").replace('"', "\\\"");
+    let safe_host = host.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!(
         r#"display dialog "{}@{} 비밀번호:" default answer "" with hidden answer with title "biy SSH" buttons {{"취소", "연결"}} default button "연결""#,
-        username, host
+        safe_user, safe_host
     );
     let output = std::process::Command::new("osascript")
         .args(["-e", &script]).output().ok()?;
@@ -634,6 +637,7 @@ fn sftp_download(id: u32, remote_path: String, local_path: String, state: State<
                     let progress = if total_size > 0 { (downloaded as f64 / total_size as f64 * 100.0) as u32 } else { 0 };
                     let _ = app_clone.emit("transfer-progress", serde_json::json!({
                         "type": "download",
+                        "tabId": id,
                         "name": file_name,
                         "progress": progress,
                         "downloaded": downloaded,
@@ -643,6 +647,7 @@ fn sftp_download(id: u32, remote_path: String, local_path: String, state: State<
 
                 let _ = app_clone.emit("transfer-complete", serde_json::json!({
                     "type": "download",
+                    "tabId": id,
                     "name": file_name,
                 }));
 
@@ -653,8 +658,11 @@ fn sftp_download(id: u32, remote_path: String, local_path: String, state: State<
         })();
 
         if let Err(e) = result {
+            // 불완전한 파일 정리
+            let _ = std::fs::remove_file(&local_path);
             let _ = app_clone.emit("transfer-error", serde_json::json!({
                 "type": "download",
+                "tabId": id,
                 "name": file_name,
                 "error": e,
             }));
@@ -706,6 +714,7 @@ fn sftp_upload(id: u32, local_path: String, remote_path: String, state: State<'_
                     let progress = if total_size > 0 { (uploaded as f64 / total_size as f64 * 100.0) as u32 } else { 0 };
                     let _ = app_clone.emit("transfer-progress", serde_json::json!({
                         "type": "upload",
+                        "tabId": id,
                         "name": file_name,
                         "progress": progress,
                         "uploaded": uploaded,
@@ -715,6 +724,7 @@ fn sftp_upload(id: u32, local_path: String, remote_path: String, state: State<'_
 
                 let _ = app_clone.emit("transfer-complete", serde_json::json!({
                     "type": "upload",
+                    "tabId": id,
                     "name": file_name,
                 }));
 
@@ -727,6 +737,7 @@ fn sftp_upload(id: u32, local_path: String, remote_path: String, state: State<'_
         if let Err(e) = result {
             let _ = app_clone.emit("transfer-error", serde_json::json!({
                 "type": "upload",
+                "tabId": id,
                 "name": file_name,
                 "error": e,
             }));
