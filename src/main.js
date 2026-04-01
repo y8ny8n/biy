@@ -46,23 +46,23 @@ async function createTab(type = 'local', sshConfig = null) {
       background: currentTheme.bg,
       foreground: currentTheme.fg,
       cursor: currentTheme.cursor,
-      selectionBackground: '#264f78',
-      black: '#000000',
-      red: '#cc3333',
-      green: '#33cc33',
-      yellow: '#cccc33',
-      blue: '#4d4de6',
-      magenta: '#cc33cc',
-      cyan: '#33cccc',
-      white: '#bfbfbf',
-      brightBlack: '#808080',
-      brightRed: '#ff4d4d',
-      brightGreen: '#4dff4d',
-      brightYellow: '#ffff4d',
-      brightBlue: '#6666ff',
-      brightMagenta: '#ff4dff',
-      brightCyan: '#4dffff',
-      brightWhite: '#ffffff',
+      selectionBackground: currentTheme.ansi?.selectionBackground || '#264f78',
+      black: currentTheme.ansi?.black || '#000000',
+      red: currentTheme.ansi?.red || '#cc3333',
+      green: currentTheme.ansi?.green || '#33cc33',
+      yellow: currentTheme.ansi?.yellow || '#cccc33',
+      blue: currentTheme.ansi?.blue || '#4d4de6',
+      magenta: currentTheme.ansi?.magenta || '#cc33cc',
+      cyan: currentTheme.ansi?.cyan || '#33cccc',
+      white: currentTheme.ansi?.white || '#bfbfbf',
+      brightBlack: currentTheme.ansi?.brightBlack || '#808080',
+      brightRed: currentTheme.ansi?.brightRed || '#ff4d4d',
+      brightGreen: currentTheme.ansi?.brightGreen || '#4dff4d',
+      brightYellow: currentTheme.ansi?.brightYellow || '#ffff4d',
+      brightBlue: currentTheme.ansi?.brightBlue || '#6666ff',
+      brightMagenta: currentTheme.ansi?.brightMagenta || '#ff4dff',
+      brightCyan: currentTheme.ansi?.brightCyan || '#4dffff',
+      brightWhite: currentTheme.ansi?.brightWhite || '#ffffff',
     },
     cursorBlink: true,
     cursorStyle: currentCursorStyle,
@@ -79,11 +79,72 @@ async function createTab(type = 'local', sshConfig = null) {
   term.open(container);
 
   // WebGL 렌더링 시도
+  let webglAddon = null;
   try {
-    term.loadAddon(new WebglAddon());
+    webglAddon = new WebglAddon();
+    term.loadAddon(webglAddon);
   } catch (e) {
     console.warn('WebGL addon failed, using canvas renderer');
   }
+
+  // macOS WKWebView 한글 IME 조합 지원
+  // 전략: xterm의 input 이벤트를 container 캡처 단계에서 가로채고,
+  //       모든 텍스트 입력을 직접 관리한다. xterm은 특수키만 처리.
+  let _imeComposing = false;
+
+  const xtermTextarea = container.querySelector('.xterm-helper-textarea');
+  if (xtermTextarea) {
+    xtermTextarea.addEventListener('compositionstart', () => {
+      _imeComposing = true;
+    });
+
+    xtermTextarea.addEventListener('compositionend', (e) => {
+      _imeComposing = false;
+      if (e.data) {
+        invoke('pty_write', { id, data: e.data }).catch(err => {
+          console.error('pty_write (IME) failed:', err);
+        });
+      }
+      xtermTextarea.value = '';
+    });
+
+    // container 캡처 단계에서 input 이벤트를 가로채 xterm이 보지 못하게 함
+    container.addEventListener('input', (e) => {
+      if (e.target !== xtermTextarea) return;
+
+      // 조합 중 → xterm 차단 (compositionend에서 처리)
+      if (_imeComposing || e.isComposing) {
+        e.stopPropagation();
+        return;
+      }
+
+      // compositionend 직후 insertFromComposition → 이미 처리됨
+      if (e.inputType === 'insertFromComposition') {
+        e.stopPropagation();
+        xtermTextarea.value = '';
+        return;
+      }
+
+      // 일반 텍스트 입력 (영문, 숫자, 기호 등) → 직접 PTY 전송
+      if (e.data) {
+        e.stopPropagation();
+        invoke('pty_write', { id, data: e.data }).catch(err => {
+          console.error('pty_write failed:', err);
+        });
+        xtermTextarea.value = '';
+      }
+    }, true); // ← capture phase: xterm의 핸들러보다 먼저 실행
+  }
+
+  // xterm은 특수키(Enter, 방향키, Ctrl조합 등)만 처리
+  // 인쇄 가능한 단일 문자는 위의 input 핸들러가 처리
+  term.attachCustomKeyEventHandler((e) => {
+    if (e.type !== 'keydown') return true;
+    if (e.isComposing || e.keyCode === 229 || _imeComposing) return false;
+    if (e.ctrlKey || e.metaKey || e.altKey) return true;
+    if (e.key.length > 1) return true; // Enter, Backspace, Arrow, F1~F12 등
+    return false; // 인쇄 가능 문자 차단 → input 이벤트로 처리
+  });
 
   fitAddon.fit();
 
@@ -119,12 +180,16 @@ async function createTab(type = 'local', sshConfig = null) {
   }
 
   // 키 입력 → Rust
+  // 텍스트 입력은 위의 input 캡처 핸들러가 처리.
+  // onData는 특수키(방향키, Ctrl+C 등)의 이스케이프 시퀀스만 전달.
   term.onData((data) => {
-    if (tab.alive) {
-      invoke('pty_write', { id: tab.id, data }).catch(e => {
-        console.error('pty_write failed:', e);
-      });
-    }
+    if (!tab.alive || _imeComposing) return;
+    // 인쇄 가능 단일 문자는 input 캡처 핸들러가 이미 전송했으므로 건너뜀
+    const code = data.charCodeAt(0);
+    if (data.length === 1 && code >= 32 && code !== 127) return;
+    invoke('pty_write', { id: tab.id, data }).catch(e => {
+      console.error('pty_write failed:', e);
+    });
   });
 
   // 터미널 클릭 시 포커스
@@ -523,10 +588,8 @@ async function downloadFile(tabId, remotePath, fileName) {
     }
     if (!localPath) return; // 취소
 
+    // 별도 스레드에서 실행되므로 즉시 반환됨 (진행률/완료/에러는 이벤트로 수신)
     await invoke('sftp_download', { id: tabId, remotePath, localPath });
-
-    // 완료 알림
-    showToast(`다운로드 완료: ${fileName}`);
   } catch (e) {
     showToast(`다운로드 실패: ${e}`, true);
   }
@@ -536,14 +599,8 @@ async function uploadFile(tabId, localPath, remoteDirPath) {
   const fileName = localPath.split('/').pop();
   const remotePath = `${remoteDirPath}/${fileName}`;
   try {
+    // 별도 스레드에서 실행되므로 즉시 반환됨 (진행률/완료/에러는 이벤트로 수신)
     await invoke('sftp_upload', { id: tabId, localPath, remotePath });
-    showToast(`업로드 완료: ${fileName}`);
-    // 파일 트리 새로고침
-    const tab = tabs.find(t => t.id === tabId);
-    if (tab) {
-      if (tab.type === 'ssh') loadRemoteFiles(tabId, remoteDirPath);
-      else loadLocalFiles(tabId, remoteDirPath);
-    }
   } catch (e) {
     showToast(`업로드 실패: ${e}`, true);
   }
@@ -866,6 +923,9 @@ listen('transfer-progress', (event) => {
 
 listen('transfer-complete', (event) => {
   const { type, name } = event.payload;
+  const label = type === 'download' ? '다운로드' : '업로드';
+  showToast(`${label} 완료: ${name}`);
+
   const bar = document.getElementById('transfer-bar');
   const item = bar.querySelector(`[data-name="${CSS.escape(name)}"]`);
   if (item) {
@@ -877,6 +937,32 @@ listen('transfer-complete', (event) => {
       item.remove();
       if (bar.children.length === 0) bar.classList.add('hidden');
     }, 3000);
+  }
+
+  // 업로드 완료 시 파일 트리 새로고침
+  if (type === 'upload') {
+    const activeTab = tabs.find(t => t.id === currentTabId);
+    if (activeTab && activeTab.sftpCwd) {
+      if (activeTab.type === 'ssh') loadRemoteFiles(currentTabId, activeTab.sftpCwd);
+      else loadLocalFiles(currentTabId, activeTab.sftpCwd);
+    }
+  }
+});
+
+listen('transfer-error', (event) => {
+  const { type, name, error } = event.payload;
+  const label = type === 'download' ? '다운로드' : '업로드';
+  showToast(`${label} 실패: ${error}`, true);
+
+  const bar = document.getElementById('transfer-bar');
+  const item = bar.querySelector(`[data-name="${CSS.escape(name)}"]`);
+  if (item) {
+    item.querySelector('.transfer-detail').textContent = `실패`;
+    item.querySelector('.transfer-progress-fill').classList.add('error');
+    setTimeout(() => {
+      item.remove();
+      if (bar.children.length === 0) bar.classList.add('hidden');
+    }, 5000);
   }
 });
 
@@ -903,6 +989,16 @@ document.querySelectorAll('.sidebar-tab').forEach(tab => {
 // ── 테마 데이터 ──
 
 const THEMES = [
+  { name: 'biy Navy', bg: '#1a1a2e', fg: '#d4d8e8', cursor: '#0078d4',
+    ansi: {
+      black: '#0f0f1a', red: '#e05561', green: '#43d08a', yellow: '#e6c07b',
+      blue: '#0078d4', magenta: '#c678dd', cyan: '#56b6c2', white: '#d4d8e8',
+      brightBlack: '#3b3d5e', brightRed: '#ff6b7a', brightGreen: '#5af5a0',
+      brightYellow: '#ffd68a', brightBlue: '#3a9eea', brightMagenta: '#dc8ef5',
+      brightCyan: '#6fd4df', brightWhite: '#f0f2f8',
+      selectionBackground: '#0078d450',
+    }
+  },
   { name: 'biy Dark', bg: '#0d1117', fg: '#d9d9d9', cursor: '#58a6ff' },
   { name: 'Dracula', bg: '#282a36', fg: '#f8f8f2', cursor: '#bd93f9' },
   { name: 'Nord', bg: '#2e3440', fg: '#d8dee9', cursor: '#88c0d0' },
@@ -977,7 +1073,17 @@ async function saveSettings() {
       background: currentTheme.bg,
       foreground: currentTheme.fg,
       cursor: currentTheme.cursor,
-      selectionBackground: '#264f78',
+      selectionBackground: currentTheme.ansi?.selectionBackground || '#264f78',
+      ...(currentTheme.ansi ? {
+        black: currentTheme.ansi.black, red: currentTheme.ansi.red,
+        green: currentTheme.ansi.green, yellow: currentTheme.ansi.yellow,
+        blue: currentTheme.ansi.blue, magenta: currentTheme.ansi.magenta,
+        cyan: currentTheme.ansi.cyan, white: currentTheme.ansi.white,
+        brightBlack: currentTheme.ansi.brightBlack, brightRed: currentTheme.ansi.brightRed,
+        brightGreen: currentTheme.ansi.brightGreen, brightYellow: currentTheme.ansi.brightYellow,
+        brightBlue: currentTheme.ansi.brightBlue, brightMagenta: currentTheme.ansi.brightMagenta,
+        brightCyan: currentTheme.ansi.brightCyan, brightWhite: currentTheme.ansi.brightWhite,
+      } : {}),
     };
     tab.fitAddon.fit();
   });

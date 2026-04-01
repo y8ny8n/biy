@@ -1,3 +1,13 @@
+/* macOS IME(한글 등) 조합 지원 — textarea를 화면 내에 유지 */
+.xterm .xterm-helper-textarea {
+  left: 0 !important;
+  width: 1px !important;
+  height: 1px !important;
+  z-index: -5 !important;
+  opacity: 0 !important;
+  overflow: hidden !important;
+}
+
 /* macOS 네이티브 다크모드 스타일 */
 :root {
   --bg-primary: #1e1e1e;

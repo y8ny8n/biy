@@ -588,101 +588,152 @@ fn sftp_sync_cwd(id: u32, state: State<'_, PtyState>) -> Result<String, String> 
     }
 }
 
-/// SFTP 파일 다운로드 (청크 단위 + 진행률)
+/// SFTP 파일 다운로드 (별도 스레드 + 이벤트 기반 진행률)
 #[tauri::command]
 fn sftp_download(id: u32, remote_path: String, local_path: String, state: State<'_, PtyState>, app: AppHandle) -> Result<(), String> {
-    let mut mgr = state.lock().map_err(|e| e.to_string())?;
-    let sftp_handle = mgr.sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
+    // 연결 존재 여부만 빠르게 확인
+    {
+        let mgr = state.lock().map_err(|e| e.to_string())?;
+        if !mgr.sftps.contains_key(&id) {
+            return Err("SFTP 연결 없음".to_string());
+        }
+    }
+
     let file_name = std::path::Path::new(&remote_path)
         .file_name().map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| remote_path.clone());
 
-    sftp_handle.session.set_blocking(true);
-    let result = (|| -> Result<(), String> {
-        let sftp = sftp_handle.session.sftp().map_err(|e| e.to_string())?;
+    let state_clone = state.inner().clone();
+    let app_clone = app.clone();
 
-        // 파일 크기 가져오기
-        let stat = sftp.stat(std::path::Path::new(&remote_path)).map_err(|e| e.to_string())?;
-        let total_size = stat.size.unwrap_or(0);
+    thread::spawn(move || {
+        let result = (|| -> Result<(), String> {
+            let mut mgr = state_clone.lock().map_err(|e| e.to_string())?;
+            let sftp_handle = mgr.sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
 
-        let mut remote_file = sftp.open(std::path::Path::new(&remote_path))
-            .map_err(|e| format!("파일 열기 실패: {}", e))?;
+            sftp_handle.session.set_blocking(true);
+            let transfer_result = (|| -> Result<(), String> {
+                let sftp = sftp_handle.session.sftp().map_err(|e| e.to_string())?;
 
-        let mut local_file = std::fs::File::create(&local_path).map_err(|e| e.to_string())?;
-        let mut downloaded: u64 = 0;
-        let mut buf = [0u8; 32768];
+                let stat = sftp.stat(std::path::Path::new(&remote_path)).map_err(|e| e.to_string())?;
+                let total_size = stat.size.unwrap_or(0);
 
-        loop {
-            let n = remote_file.read(&mut buf).map_err(|e| e.to_string())?;
-            if n == 0 { break; }
-            local_file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-            downloaded += n as u64;
+                let mut remote_file = sftp.open(std::path::Path::new(&remote_path))
+                    .map_err(|e| format!("파일 열기 실패: {}", e))?;
 
-            let progress = if total_size > 0 { (downloaded as f64 / total_size as f64 * 100.0) as u32 } else { 0 };
-            let _ = app.emit("transfer-progress", serde_json::json!({
+                let mut local_file = std::fs::File::create(&local_path).map_err(|e| e.to_string())?;
+                let mut downloaded: u64 = 0;
+                let mut buf = [0u8; 32768];
+
+                loop {
+                    let n = remote_file.read(&mut buf).map_err(|e| e.to_string())?;
+                    if n == 0 { break; }
+                    local_file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+                    downloaded += n as u64;
+
+                    let progress = if total_size > 0 { (downloaded as f64 / total_size as f64 * 100.0) as u32 } else { 0 };
+                    let _ = app_clone.emit("transfer-progress", serde_json::json!({
+                        "type": "download",
+                        "name": file_name,
+                        "progress": progress,
+                        "downloaded": downloaded,
+                        "total": total_size,
+                    }));
+                }
+
+                let _ = app_clone.emit("transfer-complete", serde_json::json!({
+                    "type": "download",
+                    "name": file_name,
+                }));
+
+                Ok(())
+            })();
+            sftp_handle.session.set_blocking(false);
+            transfer_result
+        })();
+
+        if let Err(e) = result {
+            let _ = app_clone.emit("transfer-error", serde_json::json!({
                 "type": "download",
                 "name": file_name,
-                "progress": progress,
-                "downloaded": downloaded,
-                "total": total_size,
+                "error": e,
             }));
         }
+    });
 
-        let _ = app.emit("transfer-complete", serde_json::json!({
-            "type": "download",
-            "name": file_name,
-        }));
-
-        Ok(())
-    })();
-    sftp_handle.session.set_blocking(false);
-
-    result
+    Ok(())
 }
 
-/// SFTP 파일 업로드 (청크 단위 + 진행률)
+/// SFTP 파일 업로드 (별도 스레드 + 이벤트 기반 진행률)
 #[tauri::command]
 fn sftp_upload(id: u32, local_path: String, remote_path: String, state: State<'_, PtyState>, app: AppHandle) -> Result<(), String> {
-    let mut mgr = state.lock().map_err(|e| e.to_string())?;
-    let sftp_handle = mgr.sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
+    // 연결 존재 여부만 빠르게 확인
+    {
+        let mgr = state.lock().map_err(|e| e.to_string())?;
+        if !mgr.sftps.contains_key(&id) {
+            return Err("SFTP 연결 없음".to_string());
+        }
+    }
+
     let file_name = std::path::Path::new(&local_path)
         .file_name().map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| local_path.clone());
 
-    sftp_handle.session.set_blocking(true);
-    let result = (|| -> Result<(), String> {
-        let sftp = sftp_handle.session.sftp().map_err(|e| e.to_string())?;
-        let contents = std::fs::read(&local_path).map_err(|e| e.to_string())?;
-        let total_size = contents.len() as u64;
+    let state_clone = state.inner().clone();
+    let app_clone = app.clone();
 
-        let mut remote_file = sftp.create(std::path::Path::new(&remote_path))
-            .map_err(|e| format!("파일 생성 실패: {}", e))?;
+    thread::spawn(move || {
+        let result = (|| -> Result<(), String> {
+            // 로컬 파일은 lock 밖에서 미리 읽기
+            let contents = std::fs::read(&local_path).map_err(|e| e.to_string())?;
+            let total_size = contents.len() as u64;
 
-        let mut uploaded: u64 = 0;
-        for chunk in contents.chunks(32768) {
-            remote_file.write_all(chunk).map_err(|e| e.to_string())?;
-            uploaded += chunk.len() as u64;
+            let mut mgr = state_clone.lock().map_err(|e| e.to_string())?;
+            let sftp_handle = mgr.sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
 
-            let progress = if total_size > 0 { (uploaded as f64 / total_size as f64 * 100.0) as u32 } else { 0 };
-            let _ = app.emit("transfer-progress", serde_json::json!({
+            sftp_handle.session.set_blocking(true);
+            let transfer_result = (|| -> Result<(), String> {
+                let sftp = sftp_handle.session.sftp().map_err(|e| e.to_string())?;
+
+                let mut remote_file = sftp.create(std::path::Path::new(&remote_path))
+                    .map_err(|e| format!("파일 생성 실패: {}", e))?;
+
+                let mut uploaded: u64 = 0;
+                for chunk in contents.chunks(32768) {
+                    remote_file.write_all(chunk).map_err(|e| e.to_string())?;
+                    uploaded += chunk.len() as u64;
+
+                    let progress = if total_size > 0 { (uploaded as f64 / total_size as f64 * 100.0) as u32 } else { 0 };
+                    let _ = app_clone.emit("transfer-progress", serde_json::json!({
+                        "type": "upload",
+                        "name": file_name,
+                        "progress": progress,
+                        "uploaded": uploaded,
+                        "total": total_size,
+                    }));
+                }
+
+                let _ = app_clone.emit("transfer-complete", serde_json::json!({
+                    "type": "upload",
+                    "name": file_name,
+                }));
+
+                Ok(())
+            })();
+            sftp_handle.session.set_blocking(false);
+            transfer_result
+        })();
+
+        if let Err(e) = result {
+            let _ = app_clone.emit("transfer-error", serde_json::json!({
                 "type": "upload",
                 "name": file_name,
-                "progress": progress,
-                "uploaded": uploaded,
-                "total": total_size,
+                "error": e,
             }));
         }
+    });
 
-        let _ = app.emit("transfer-complete", serde_json::json!({
-            "type": "upload",
-            "name": file_name,
-        }));
-
-        Ok(())
-    })();
-    sftp_handle.session.set_blocking(false);
-
-    result
+    Ok(())
 }
 
 /// PTY 셸의 현재 작업 디렉토리 가져오기 (macOS: lsof 사용)
