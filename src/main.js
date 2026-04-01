@@ -133,13 +133,15 @@ async function createTab(type = 'local', sshConfig = null) {
       }
 
       // 붙여넣기 → xterm onData에서 처리하므로 여기서는 무시 (2중 전송 방지)
-      if (e.inputType === 'insertFromPaste') {
+      // WKWebView에서는 inputType이 insertFromPaste 대신 insertText로 올 수 있으므로
+      // 다중 문자 입력(붙여넣기)은 모두 onData에 위임
+      if (e.inputType === 'insertFromPaste' || (e.data && e.data.length > 1)) {
         e.stopPropagation();
         xtermTextarea.value = '';
         return;
       }
 
-      // 일반 텍스트 입력 (영문, 숫자, 기호 등) → 직접 PTY 전송
+      // 일반 텍스트 입력 (영문, 숫자, 기호 등 단일 문자) → 직접 PTY 전송
       if (e.data) {
         e.stopPropagation();
         invoke('pty_write', { id, data: e.data }).catch(err => {
