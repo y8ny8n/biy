@@ -1,6 +1,6 @@
 [package]
 name = "biy"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI-integrated terminal emulator"
 authors = ["kyoungyoon"]
 license = "MIT"

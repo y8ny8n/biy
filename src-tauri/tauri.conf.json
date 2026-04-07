@@ -1,13 +1,13 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "biy",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.biy.terminal",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "",
-    "beforeBuildCommand": ""
+    "beforeDevCommand": "npx esbuild src/main.js --bundle --outfile=dist/main.js --format=esm --platform=browser && cp src/styles.css dist/ && cp src/index.html dist/",
+    "beforeBuildCommand": "npx esbuild src/main.js --bundle --outfile=dist/main.js --format=esm --platform=browser && cp src/styles.css dist/ && cp src/index.html dist/"
   },
   "app": {
     "withGlobalTauri": true,
