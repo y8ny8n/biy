@@ -405,16 +405,98 @@ body {
   color: var(--text-primary);
 }
 
-.file-tree-cwd {
+.file-tree-cwd-wrap {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+.file-tree-cwd-input {
+  width: 100%;
   font-size: 10px;
   color: var(--text-dim);
   font-family: 'SF Mono', 'Menlo', monospace;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 3px 6px;
+  outline: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: all 0.12s;
+  /* body의 user-select: none 무시 — WebKit에서 input 입력 차단 방지 */
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.file-tree-cwd-input:hover {
+  border-color: var(--border);
+}
+
+.file-tree-cwd-input:focus {
+  border-color: var(--accent);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+@keyframes file-tree-cwd-shake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-6px); }
+  40% { transform: translateX(6px); }
+  60% { transform: translateX(-4px); }
+  80% { transform: translateX(4px); }
+}
+
+.file-tree-cwd-input.error {
+  border-color: #cc3333;
+  color: #cc3333;
+  animation: file-tree-cwd-shake 0.4s;
+}
+
+.file-tree-suggest {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+  z-index: 100;
+}
+
+.file-tree-suggest.hidden {
+  display: none;
+}
+
+.file-tree-suggest-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-family: 'SF Mono', 'Menlo', monospace;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.file-tree-suggest-item:hover,
+.file-tree-suggest-item.selected {
+  background: var(--accent);
+  color: white;
+}
+
+.file-tree-suggest-icon {
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+.file-tree-suggest-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  direction: rtl;
-  text-align: left;
-  flex: 1;
 }
 
 .file-tree-refresh {

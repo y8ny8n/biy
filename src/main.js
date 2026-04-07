@@ -359,236 +359,443 @@ function renderTabBar() {
   renderSessionList();
 }
 
-// ── 원격 파일 트리 ──
+// ── 파일 트리 (사이드바) ──
 
-async function loadRemoteFiles(tabId, path) {
-  try {
-    // path가 없으면 저장된 cwd 가져오기
-    if (!path) {
-      try { path = await invoke('sftp_get_cwd', { id: tabId }); } catch {}
-    }
-    const files = await invoke('sftp_list_dir', { id: tabId, path: path || null });
-    // sftp_list_dir가 cwd를 업데이트하므로 path를 그대로 사용
-    renderFileTree(tabId, 'ssh', path || '/root', files);
-  } catch (e) {
-    console.log('SFTP not available for tab:', tabId, e);
-  }
+// 홈 디렉토리 캐시
+let _homeDirCache = null;
+async function getHomeDir() {
+  if (_homeDirCache) return _homeDirCache;
+  try { _homeDirCache = await invoke('home_dir'); }
+  catch { _homeDirCache = '/tmp'; }
+  return _homeDirCache;
 }
 
-async function loadLocalFiles(tabId, path) {
-  const dir = path || getTabCwd(tabId);
-  if (!dir) return;
-  try {
-    const files = await invoke('local_list_dir', { path: dir, showHidden: showHiddenFiles });
-    renderFileTree(tabId, 'local', dir, files);
-  } catch (e) {
-    console.log('Local dir not available:', e);
-  }
-}
-
-function extractPathFromTitle(title) {
+// 탭 타이틀에서 경로 추출 (예: "user@host:~/path")
+function pathFromTitle(title) {
   if (!title) return null;
-
-  // 패턴 1: "user@host:~/path" 또는 "user@host:/path"
   const colonIdx = title.lastIndexOf(':');
   if (colonIdx !== -1) {
     let p = title.substring(colonIdx + 1).trim();
-    // ~ → 홈 디렉토리 확장
-    if (p.startsWith('~')) {
-      const home = '/Users/' + (title.split('@')[0] || '').split('/').pop();
-      p = p.replace('~', home);
-    }
+    if (p.startsWith('~') && _homeDirCache) p = _homeDirCache + p.slice(1);
     if (p.startsWith('/')) return p;
   }
-
-  // 패턴 2: 절대 경로만 있는 경우
-  const match = title.match(/(\/[\w\-\/.]+)/);
-  if (match) return match[1];
-
-  return null;
+  const m = title.match(/(\/[\w\-\/.]+)/);
+  return m ? m[1] : null;
 }
 
-function getTabCwd(tabId) {
-  const tab = tabs.find(t => t.id === tabId);
-  if (!tab) return null;
-  const title = tab.title;
-  // 타이틀에서 경로 추출: "user@host:~/path" 또는 "~/path"
-  const colonIdx = title.lastIndexOf(':');
-  if (colonIdx !== -1) {
-    let p = title.substring(colonIdx + 1).trim();
-    if (p.startsWith('~')) {
-      p = p.replace('~', process?.env?.HOME || '/Users/' + (title.split('@')[0] || 'user'));
-    }
-    return p || null;
-  }
-  // 홈 디렉토리 폴백
-  return null;
-}
+const fileTreeView = {
+  els: null,
+  state: { tabId: null, type: 'local', cwd: '', files: [], editing: false },
+  _suggestItems: [],
+  _suggestSelected: -1,
+  _suggestTimer: null,
+  _composing: false,
 
-async function loadFilesForTab(tabId) {
-  const tab = tabs.find(t => t.id === tabId);
-  if (!tab) return;
-  if (tab.type === 'ssh') {
-    await loadRemoteFiles(tabId);
-  } else {
-    // 로컬: 홈 디렉토리부터 시작
-    const home = await getHomeDir();
-    await loadLocalFiles(tabId, home);
-  }
-}
+  _mount() {
+    const sessionList = document.getElementById('session-list');
+    if (!sessionList) return null;
+    sessionList.innerHTML = '';
 
-async function getHomeDir() {
-  try {
-    const files = await invoke('local_list_dir', { path: '/Users' });
-    // /Users에서 현재 사용자 폴더 찾기
-    const userDir = files.find(f => f.is_dir && !['Shared', '.localized'].includes(f.name));
-    return userDir ? userDir.path : '/Users';
-  } catch {
-    return '/tmp';
-  }
-}
+    const container = document.createElement('div');
+    container.className = 'file-tree-container';
 
-function renderFileTree(tabId, type, cwd, files) {
-  const sessionList = document.getElementById('session-list');
-  if (!sessionList) return;
+    // 경로 바
+    const pathBar = document.createElement('div');
+    pathBar.className = 'file-tree-path';
 
-  // 기존 내용 전부 제거
-  sessionList.innerHTML = '';
+    const upBtn = document.createElement('button');
+    upBtn.className = 'file-tree-up';
+    upBtn.title = '상위 폴더';
+    upBtn.textContent = '↑';
 
-  const container = document.createElement('div');
-  container.className = 'file-tree-container';
+    const refreshBtn = document.createElement('button');
+    refreshBtn.className = 'file-tree-refresh';
+    refreshBtn.title = '새로고침';
+    refreshBtn.textContent = '↻';
 
-  // 현재 경로 표시
-  const pathBar = document.createElement('div');
-  pathBar.className = 'file-tree-path';
-  pathBar.innerHTML = `
-    <button class="file-tree-up" title="상위 폴더">↑</button>
-    <button class="file-tree-refresh" title="새로고침">↻</button>
-    <button class="file-tree-hidden ${showHiddenFiles ? 'active' : ''}" title="숨김 파일 표시">.*</button>
-    <span class="file-tree-cwd" title="${escapeHtml(cwd)}">${escapeHtml(cwd)}</span>
-    <button class="file-tree-cd" title="터미널에서 이 경로로 이동">cd</button>
-  `;
+    const hiddenBtn = document.createElement('button');
+    hiddenBtn.className = 'file-tree-hidden';
+    hiddenBtn.title = '숨김 파일 표시';
+    hiddenBtn.textContent = '.*';
 
-  pathBar.querySelector('.file-tree-hidden').addEventListener('click', () => {
-    showHiddenFiles = !showHiddenFiles;
-    if (type === 'ssh') loadRemoteFiles(tabId, cwd);
-    else loadLocalFiles(tabId, cwd);
-  });
+    const cwdWrap = document.createElement('div');
+    cwdWrap.className = 'file-tree-cwd-wrap';
 
-  pathBar.querySelector('.file-tree-refresh').addEventListener('click', async () => {
-    const tab = tabs.find(t => t.id === tabId);
-    if (!tab) return;
-    if (tab.type === 'ssh') {
-      // SSH: 터미널에 pwd 명령 보내서 실제 경로 파싱
-      const realCwd = await getPwdFromTerminal(tabId);
-      if (realCwd) {
-        loadRemoteFiles(tabId, realCwd);
-      } else {
-        loadRemoteFiles(tabId, cwd);
-      }
-    } else {
-      // 로컬: lsof로 실제 경로 가져오기
-      try {
-        const realCwd = await invoke('get_pty_cwd', { id: tabId });
-        loadLocalFiles(tabId, realCwd);
-      } catch {
-        loadLocalFiles(tabId, cwd);
-      }
-    }
-  });
+    const cwdInput = document.createElement('input');
+    cwdInput.className = 'file-tree-cwd-input';
+    cwdInput.type = 'text';
+    cwdInput.spellcheck = false;
+    cwdInput.autocomplete = 'off';
+    cwdInput.placeholder = '경로 입력 (Tab=자동완성, Enter=이동)';
 
-  pathBar.querySelector('.file-tree-cd').addEventListener('click', () => {
-    const tab = tabs.find(t => t.id === tabId);
-    if (tab && tab.alive) {
-      // Ctrl+U로 현재 입력 지우고 cd 전송 (쉘 특수문자 escape)
-      const safeCwd = cwd.replace(/([\\\"$`!])/g, '\\$1');
-      invoke('pty_write', { id: tabId, data: `\x15cd "${safeCwd}"\r` });
-    }
-  });
-  pathBar.querySelector('.file-tree-up').addEventListener('click', () => {
-    const parent = cwd.split('/').slice(0, -1).join('/') || '/';
-    if (type === 'ssh') loadRemoteFiles(tabId, parent);
-    else loadLocalFiles(tabId, parent);
-  });
-  container.appendChild(pathBar);
+    const suggest = document.createElement('div');
+    suggest.className = 'file-tree-suggest hidden';
 
-  // 파일 목록
-  const list = document.createElement('div');
-  list.className = 'file-tree-list';
+    cwdWrap.append(cwdInput, suggest);
 
-  files.forEach(file => {
-    const el = document.createElement('div');
-    el.className = 'file-tree-item';
-    if (file.is_dir) {
-      el.innerHTML = `
-        <span class="file-tree-icon">📁</span>
-        <span class="file-tree-name">${escapeHtml(file.name)}</span>
-      `;
-      el.addEventListener('dblclick', () => {
-        if (type === 'ssh') loadRemoteFiles(tabId, file.path);
-        else loadLocalFiles(tabId, file.path);
-      });
-    } else {
-      el.innerHTML = `
-        <span class="file-tree-icon">📄</span>
-        <span class="file-tree-name">${escapeHtml(file.name)}</span>
-        <span class="file-tree-size">${formatSize(file.size)}</span>
-        <button class="file-tree-download" title="다운로드">↓</button>
-      `;
-      el.querySelector('.file-tree-download').addEventListener('click', (e) => {
-        e.stopPropagation();
-        downloadFile(tabId, file.path, file.name);
-      });
-      el.addEventListener('dblclick', () => downloadFile(tabId, file.path, file.name));
-    }
-    // 우클릭 컨텍스트 메뉴 (폴더/파일 공통)
-    el.addEventListener('contextmenu', (e) => {
-      showContextMenu(e, { tabId, type, path: file.path, name: file.name, isDir: file.is_dir, cwd });
+    const cdBtn = document.createElement('button');
+    cdBtn.className = 'file-tree-cd';
+    cdBtn.title = '터미널에서 이 경로로 이동';
+    cdBtn.textContent = 'cd';
+
+    pathBar.append(upBtn, refreshBtn, hiddenBtn, cwdWrap, cdBtn);
+
+    const list = document.createElement('div');
+    list.className = 'file-tree-list';
+
+    const dropZone = document.createElement('div');
+    dropZone.className = 'file-tree-dropzone';
+    dropZone.textContent = '파일을 여기에 드롭하여 업로드';
+
+    container.append(pathBar, list, dropZone);
+    sessionList.appendChild(container);
+
+    this.els = { container, pathBar, upBtn, refreshBtn, hiddenBtn, cwdInput, cwdWrap, suggest, cdBtn, list, dropZone };
+    this._bindEvents();
+    return this.els;
+  },
+
+  _bindEvents() {
+    const { upBtn, refreshBtn, hiddenBtn, cwdInput, suggest, cdBtn, list, container } = this.els;
+
+    upBtn.addEventListener('click', () => {
+      const cwd = this.state.cwd;
+      const parent = cwd.replace(/\/+$/, '').split('/').slice(0, -1).join('/') || '/';
+      this.load(this.state.tabId, parent);
     });
 
-    list.appendChild(el);
-  });
+    refreshBtn.addEventListener('click', async () => {
+      const { tabId, type, cwd } = this.state;
+      let realCwd = cwd;
+      try {
+        if (type === 'ssh') {
+          realCwd = (await getPwdFromTerminal(tabId)) || cwd;
+        } else {
+          realCwd = await invoke('get_pty_cwd', { id: tabId });
+        }
+      } catch {}
+      this.load(tabId, realCwd);
+    });
 
-  if (files.length === 0) {
-    list.innerHTML = '<div class="sidebar-empty">빈 디렉토리</div>';
-  }
+    hiddenBtn.addEventListener('click', () => {
+      showHiddenFiles = !showHiddenFiles;
+      hiddenBtn.classList.toggle('active', showHiddenFiles);
+      this.load(this.state.tabId, this.state.cwd);
+    });
 
-  container.appendChild(list);
+    cdBtn.addEventListener('click', () => {
+      const tab = tabs.find(t => t.id === this.state.tabId);
+      if (!tab || !tab.alive) return;
+      const safe = this.state.cwd.replace(/([\\"$`!])/g, '\\$1');
+      invoke('pty_write', { id: tab.id, data: `\x15cd "${safe}"\r` });
+    });
 
-  // 드래그 앤 드롭 업로드 영역
-  const dropZone = document.createElement('div');
-  dropZone.className = 'file-tree-dropzone';
-  dropZone.textContent = '파일을 여기에 드롭하여 업로드';
+    // 주소창 입력
+    cwdInput.addEventListener('focus', () => {
+      this.state.editing = true;
+      cwdInput.select();
+    });
 
-  container.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    dropZone.classList.add('active');
-  });
+    cwdInput.addEventListener('blur', () => {
+      // 자동완성 클릭 시 blur가 먼저 발생하므로 약간 지연
+      setTimeout(() => {
+        this.state.editing = false;
+        this._hideSuggest();
+        cwdInput.value = this.state.cwd;
+        cwdInput.classList.remove('error');
+      }, 150);
+    });
 
-  container.addEventListener('dragleave', (e) => {
-    e.preventDefault();
-    dropZone.classList.remove('active');
-  });
+    cwdInput.addEventListener('compositionstart', () => { this._composing = true; });
+    cwdInput.addEventListener('compositionend', () => {
+      this._composing = false;
+      this._scheduleSuggest();
+    });
 
-  container.addEventListener('drop', async (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    dropZone.classList.remove('active');
+    cwdInput.addEventListener('input', () => {
+      if (this._composing) return;
+      this._scheduleSuggest();
+    });
 
-    // Tauri file drop 이벤트에서 파일 경로 가져오기
-    const files = e.dataTransfer?.files;
-    if (files && files.length > 0) {
-      for (const file of files) {
-        // 웹뷰 drop은 파일 경로를 직접 못 가져옴 → Tauri drag-drop 이벤트 사용
-        showToast('Finder에서 드래그 시 ⌘+U 업로드를 사용하세요');
+    cwdInput.addEventListener('keydown', async (e) => {
+      if (this._composing) return;
+
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const expanded = await this._expandPath(cwdInput.value.trim());
+        if (!expanded) return;
+        const ok = await this._tryNavigate(expanded);
+        if (!ok) this._shake();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        cwdInput.value = this.state.cwd;
+        this._hideSuggest();
+        cwdInput.blur();
+      } else if (e.key === 'Tab') {
+        e.preventDefault();
+        const items = this._suggestItems;
+        if (items.length > 0) {
+          const pick = items[Math.max(this._suggestSelected, 0)];
+          cwdInput.value = pick.path + (pick.is_dir ? '/' : '');
+          this._scheduleSuggest(0);
+        } else {
+          this._scheduleSuggest(0);
+        }
+      } else if (e.key === 'ArrowDown') {
+        if (this._suggestItems.length === 0) { this._scheduleSuggest(0); return; }
+        e.preventDefault();
+        this._suggestSelected = Math.min(this._suggestSelected + 1, this._suggestItems.length - 1);
+        this._renderSuggestSelection();
+      } else if (e.key === 'ArrowUp') {
+        if (this._suggestItems.length === 0) return;
+        e.preventDefault();
+        this._suggestSelected = Math.max(this._suggestSelected - 1, 0);
+        this._renderSuggestSelection();
       }
-    }
-  });
+    });
 
-  container.appendChild(dropZone);
-  sessionList.appendChild(container);
-}
+    // 자동완성 패널: blur 방지 + 항목 선택
+    suggest.addEventListener('mousedown', (e) => e.preventDefault());
+    suggest.addEventListener('click', (e) => {
+      const item = e.target.closest('.file-tree-suggest-item');
+      if (!item) return;
+      const idx = Number(item.dataset.idx);
+      const pick = this._suggestItems[idx];
+      if (!pick) return;
+      cwdInput.value = pick.path + (pick.is_dir ? '/' : '');
+      cwdInput.focus();
+      this._scheduleSuggest(0);
+    });
+
+    // 파일 목록 이벤트 위임
+    list.addEventListener('click', (e) => {
+      if (e.target.closest('.file-tree-download')) {
+        e.stopPropagation();
+        const file = this._fileFromEvent(e);
+        if (file) downloadFile(this.state.tabId, file.path, file.name);
+      }
+    });
+
+    list.addEventListener('dblclick', (e) => {
+      const file = this._fileFromEvent(e);
+      if (!file) return;
+      if (file.is_dir) this.load(this.state.tabId, file.path);
+      else downloadFile(this.state.tabId, file.path, file.name);
+    });
+
+    list.addEventListener('contextmenu', (e) => {
+      const file = this._fileFromEvent(e);
+      if (!file) return;
+      showContextMenu(e, {
+        tabId: this.state.tabId,
+        type: this.state.type,
+        path: file.path,
+        name: file.name,
+        isDir: file.is_dir,
+        cwd: this.state.cwd,
+      });
+    });
+
+    // 드래그 앤 드롭 (실제 업로드는 tauri://drag-drop 이벤트에서 처리)
+    container.addEventListener('dragover', (e) => {
+      e.preventDefault(); e.stopPropagation();
+      this.els.dropZone.classList.add('active');
+    });
+    container.addEventListener('dragleave', (e) => {
+      e.preventDefault();
+      this.els.dropZone.classList.remove('active');
+    });
+    container.addEventListener('drop', (e) => {
+      e.preventDefault(); e.stopPropagation();
+      this.els.dropZone.classList.remove('active');
+    });
+  },
+
+  _fileFromEvent(e) {
+    const el = e.target.closest('.file-tree-item');
+    if (!el) return null;
+    return this.state.files[Number(el.dataset.idx)] || null;
+  },
+
+  async _expandPath(input) {
+    if (!input) return '';
+    if (input === '~') return await getHomeDir();
+    if (input.startsWith('~/')) return (await getHomeDir()) + input.slice(1);
+    return input;
+  },
+
+  _scheduleSuggest(delay = 120) {
+    clearTimeout(this._suggestTimer);
+    this._suggestTimer = setTimeout(() => this._runSuggest(), delay);
+  },
+
+  async _runSuggest() {
+    // 로컬 탭에서만 자동완성
+    if (this.state.type !== 'local') { this._hideSuggest(); return; }
+    const raw = this.els.cwdInput.value;
+    if (!raw) { this._hideSuggest(); return; }
+    const expanded = await this._expandPath(raw);
+
+    let parent, prefix;
+    if (expanded.endsWith('/')) {
+      parent = expanded || '/';
+      prefix = '';
+    } else {
+      const idx = expanded.lastIndexOf('/');
+      if (idx < 0) { this._hideSuggest(); return; }
+      parent = expanded.slice(0, idx) || '/';
+      prefix = expanded.slice(idx + 1).toLowerCase();
+    }
+
+    let files;
+    try {
+      files = await invoke('local_list_dir', { path: parent, showHidden: showHiddenFiles });
+    } catch { this._hideSuggest(); return; }
+
+    this._suggestItems = files
+      .filter(f => !prefix || f.name.toLowerCase().startsWith(prefix))
+      .slice(0, 12);
+    this._suggestSelected = this._suggestItems.length > 0 ? 0 : -1;
+    this._renderSuggest();
+  },
+
+  _renderSuggest() {
+    const sg = this.els.suggest;
+    if (this._suggestItems.length === 0) { this._hideSuggest(); return; }
+    sg.innerHTML = this._suggestItems.map((f, i) => `
+      <div class="file-tree-suggest-item${i === this._suggestSelected ? ' selected' : ''}" data-idx="${i}">
+        <span class="file-tree-suggest-icon">${f.is_dir ? '📁' : '📄'}</span>
+        <span class="file-tree-suggest-name">${escapeHtml(f.name)}</span>
+      </div>
+    `).join('');
+    sg.classList.remove('hidden');
+  },
+
+  _renderSuggestSelection() {
+    const sg = this.els.suggest;
+    sg.querySelectorAll('.file-tree-suggest-item').forEach((el, i) => {
+      el.classList.toggle('selected', i === this._suggestSelected);
+    });
+    const sel = sg.querySelector('.selected');
+    if (sel) sel.scrollIntoView({ block: 'nearest' });
+  },
+
+  _hideSuggest() {
+    this._suggestItems = [];
+    this._suggestSelected = -1;
+    this.els.suggest.classList.add('hidden');
+    this.els.suggest.innerHTML = '';
+  },
+
+  async _tryNavigate(expanded) {
+    try {
+      if (this.state.type === 'ssh') {
+        const files = await invoke('sftp_list_dir', { id: this.state.tabId, path: expanded });
+        this.update(this.state.tabId, 'ssh', expanded, files);
+      } else {
+        const files = await invoke('local_list_dir', { path: expanded, showHidden: showHiddenFiles });
+        this.update(this.state.tabId, 'local', expanded, files);
+      }
+      this.state.editing = false;
+      this._hideSuggest();
+      this.els.cwdInput.blur();
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  _shake() {
+    const inp = this.els.cwdInput;
+    inp.classList.remove('error');
+    void inp.offsetWidth;
+    inp.classList.add('error');
+  },
+
+  async load(tabId, path) {
+    if (!this.els) this._mount();
+    if (!this.els) return;
+    try {
+      const tab = tabs.find(t => t.id === tabId);
+      if (!tab) return;
+      if (tab.type === 'ssh') {
+        if (!path) {
+          try { path = await invoke('sftp_get_cwd', { id: tabId }); } catch {}
+        }
+        const files = await invoke('sftp_list_dir', { id: tabId, path: path || null });
+        this.update(tabId, 'ssh', path || '/root', files);
+      } else {
+        const dir = path || (await getHomeDir());
+        const files = await invoke('local_list_dir', { path: dir, showHidden: showHiddenFiles });
+        this.update(tabId, 'local', dir, files);
+      }
+    } catch (e) {
+      console.log('파일 트리 로드 실패:', e);
+    }
+  },
+
+  update(tabId, type, cwd, files) {
+    if (!this.els) this._mount();
+    if (!this.els) return;
+
+    this.state.tabId = tabId;
+    this.state.type = type;
+    this.state.cwd = cwd;
+    this.state.files = files;
+
+    const { cwdInput, hiddenBtn, list } = this.els;
+
+    // 사용자가 입력 중이면 입력값을 덮어쓰지 않음
+    if (!this.state.editing) {
+      cwdInput.value = cwd;
+      cwdInput.title = cwd;
+    }
+    hiddenBtn.classList.toggle('active', showHiddenFiles);
+
+    // 파일 목록 (이벤트 위임 → DocumentFragment)
+    list.innerHTML = '';
+    if (files.length === 0) {
+      list.innerHTML = '<div class="sidebar-empty">빈 디렉토리</div>';
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    files.forEach((file, idx) => {
+      const el = document.createElement('div');
+      el.className = 'file-tree-item';
+      el.dataset.idx = idx;
+
+      const icon = document.createElement('span');
+      icon.className = 'file-tree-icon';
+      icon.textContent = file.is_dir ? '📁' : '📄';
+      el.appendChild(icon);
+
+      const name = document.createElement('span');
+      name.className = 'file-tree-name';
+      name.textContent = file.name;
+      el.appendChild(name);
+
+      if (!file.is_dir) {
+        const size = document.createElement('span');
+        size.className = 'file-tree-size';
+        size.textContent = formatSize(file.size);
+        el.appendChild(size);
+
+        const dl = document.createElement('button');
+        dl.className = 'file-tree-download';
+        dl.title = '다운로드';
+        dl.textContent = '↓';
+        el.appendChild(dl);
+      }
+      frag.appendChild(el);
+    });
+    list.appendChild(frag);
+  },
+};
+
+// ── 호환 래퍼 (기존 호출 사이트 유지) ──
+async function loadRemoteFiles(tabId, path) { await fileTreeView.load(tabId, path); }
+async function loadLocalFiles(tabId, path) { await fileTreeView.load(tabId, path); }
+async function loadFilesForTab(tabId) { await fileTreeView.load(tabId); }
 
 // Tauri 파일 드롭 이벤트 (Finder에서 드래그)
 listen('tauri://drag-drop', async (event) => {
@@ -598,9 +805,7 @@ listen('tauri://drag-drop', async (event) => {
   const tab = tabs.find(t => t.id === activeTabId);
   if (!tab) return;
 
-  // 현재 파일 트리의 경로 가져오기
-  const cwdEl = document.querySelector('.file-tree-cwd');
-  const cwd = cwdEl?.title || cwdEl?.textContent || '/';
+  const cwd = fileTreeView.state.cwd || '/';
 
   for (const localPath of paths) {
     await uploadFile(tab.id, localPath, cwd);
@@ -619,7 +824,7 @@ async function downloadFile(tabId, remotePath, fileName) {
       });
     } else {
       // 다이얼로그 없으면 Downloads 폴더
-      localPath = `/Users/${await getUsername()}/Downloads/${fileName}`;
+      localPath = `${await getHomeDir()}/Downloads/${fileName}`;
     }
     if (!localPath) return; // 취소
 
@@ -639,14 +844,6 @@ async function uploadFile(tabId, localPath, remoteDirPath) {
   } catch (e) {
     showToast(`업로드 실패: ${e}`, true);
   }
-}
-
-async function getUsername() {
-  try {
-    const files = await invoke('local_list_dir', { path: '/Users' });
-    const user = files.find(f => f.is_dir && !['Shared', '.localized'].includes(f.name));
-    return user ? user.name : 'user';
-  } catch { return 'user'; }
 }
 
 // 토스트 알림
@@ -818,9 +1015,9 @@ listen('pty-title', (event) => {
 
     // 활성 탭이면 파일 트리도 갱신 (로컬 탭만, SSH는 별도 관리)
     if (id === activeTabId && tab.type !== 'ssh') {
-      const path = extractPathFromTitle(title);
+      const path = pathFromTitle(title);
       if (path) {
-        loadLocalFiles(id, path);
+        fileTreeView.load(id, path);
       }
     }
   }

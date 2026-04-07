@@ -775,6 +775,14 @@ fn get_pty_cwd(id: u32, state: State<'_, PtyState>) -> Result<String, String> {
     Err("CWD를 찾을 수 없음".to_string())
 }
 
+/// 사용자 홈 디렉토리
+#[tauri::command]
+fn home_dir() -> Result<String, String> {
+    dirs::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .ok_or_else(|| "홈 디렉토리 없음".to_string())
+}
+
 /// 로컬 디렉토리 목록
 #[tauri::command]
 fn local_list_dir(path: String, show_hidden: Option<bool>) -> Result<Vec<FileEntry>, String> {
@@ -980,6 +988,7 @@ pub fn run() {
             sftp_download,
             sftp_upload,
             local_list_dir,
+            home_dir,
             get_pty_cwd,
         ])
         .run(tauri::generate_context!())
