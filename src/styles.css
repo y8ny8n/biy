@@ -377,14 +377,32 @@ body {
 
 .file-tree-path {
   display: flex;
-  align-items: center;
+  flex-direction: column;
   padding: 6px 8px;
-  gap: 4px;
+  gap: 6px;
   border-bottom: 1px solid rgba(255,255,255,0.04);
   background: rgba(255,255,255,0.02);
 }
 
-.file-tree-up {
+.file-tree-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.file-tree-actions-left,
+.file-tree-actions-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.file-tree-actions-right {
+  margin-left: auto;
+}
+
+/* 공통 버튼 스타일 */
+.file-tree-btn {
   background: none;
   border: 1px solid var(--border);
   color: var(--text-secondary);
@@ -393,33 +411,35 @@ body {
   border-radius: 4px;
   cursor: pointer;
   font-size: 12px;
+  font-family: inherit;
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
+  padding: 0;
   transition: all 0.1s;
 }
 
-.file-tree-up:hover {
+.file-tree-btn:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
 }
 
 .file-tree-cwd-wrap {
   position: relative;
-  flex: 1;
+  width: 100%;
   min-width: 0;
 }
 
 .file-tree-cwd-input {
   width: 100%;
-  font-size: 10px;
-  color: var(--text-dim);
+  font-size: 11px;
+  color: var(--text-secondary);
   font-family: 'SF Mono', 'Menlo', monospace;
-  background: transparent;
-  border: 1px solid transparent;
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
   border-radius: 4px;
-  padding: 3px 6px;
+  padding: 5px 8px;
   outline: none;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -430,12 +450,11 @@ body {
 }
 
 .file-tree-cwd-input:hover {
-  border-color: var(--border);
+  border-color: var(--text-dim);
 }
 
 .file-tree-cwd-input:focus {
   border-color: var(--accent);
-  background: var(--bg-primary);
   color: var(--text-primary);
 }
 
@@ -482,7 +501,6 @@ body {
   cursor: pointer;
 }
 
-.file-tree-suggest-item:hover,
 .file-tree-suggest-item.selected {
   background: var(--accent);
   color: white;
@@ -500,42 +518,12 @@ body {
 }
 
 .file-tree-refresh {
-  background: none;
-  border: 1px solid var(--border);
-  color: var(--text-secondary);
-  width: 22px;
-  height: 22px;
-  border-radius: 4px;
-  cursor: pointer;
   font-size: 13px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-  transition: all 0.1s;
-}
-
-.file-tree-refresh:hover {
-  background: var(--bg-hover);
-  color: var(--text-primary);
 }
 
 .file-tree-hidden {
-  background: none;
-  border: 1px solid var(--border);
-  color: var(--text-dim);
-  padding: 2px 5px;
-  border-radius: 4px;
-  cursor: pointer;
-  font-size: 10px;
   font-family: 'SF Mono', monospace;
-  flex-shrink: 0;
-  transition: all 0.1s;
-}
-
-.file-tree-hidden:hover {
-  background: var(--bg-hover);
-  color: var(--text-primary);
+  font-size: 10px;
 }
 
 .file-tree-hidden.active {
@@ -546,19 +534,16 @@ body {
 
 .file-tree-cd {
   background: var(--accent);
-  border: none;
+  border-color: var(--accent);
   color: white;
-  font-size: 10px;
+  font-size: 13px;
   font-weight: 600;
-  padding: 2px 8px;
-  border-radius: 4px;
-  cursor: pointer;
-  flex-shrink: 0;
-  transition: all 0.1s;
 }
 
 .file-tree-cd:hover {
-  opacity: 0.85;
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  color: white;
 }
 
 .file-tree-list {

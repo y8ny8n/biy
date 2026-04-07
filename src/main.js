@@ -399,25 +399,46 @@ const fileTreeView = {
     const container = document.createElement('div');
     container.className = 'file-tree-container';
 
-    // 경로 바
+    // 경로 바 (2단: 액션 줄 + 주소창 줄)
     const pathBar = document.createElement('div');
     pathBar.className = 'file-tree-path';
 
+    // 액션 줄
+    const actions = document.createElement('div');
+    actions.className = 'file-tree-actions';
+
+    const actionsLeft = document.createElement('div');
+    actionsLeft.className = 'file-tree-actions-left';
+
     const upBtn = document.createElement('button');
-    upBtn.className = 'file-tree-up';
+    upBtn.className = 'file-tree-btn file-tree-up';
     upBtn.title = '상위 폴더';
     upBtn.textContent = '↑';
 
-    const refreshBtn = document.createElement('button');
-    refreshBtn.className = 'file-tree-refresh';
-    refreshBtn.title = '새로고침';
-    refreshBtn.textContent = '↻';
-
     const hiddenBtn = document.createElement('button');
-    hiddenBtn.className = 'file-tree-hidden';
+    hiddenBtn.className = 'file-tree-btn file-tree-hidden';
     hiddenBtn.title = '숨김 파일 표시';
     hiddenBtn.textContent = '.*';
 
+    actionsLeft.append(upBtn, hiddenBtn);
+
+    const actionsRight = document.createElement('div');
+    actionsRight.className = 'file-tree-actions-right';
+
+    const refreshBtn = document.createElement('button');
+    refreshBtn.className = 'file-tree-btn file-tree-refresh';
+    refreshBtn.title = '새로고침';
+    refreshBtn.textContent = '↻';
+
+    const cdBtn = document.createElement('button');
+    cdBtn.className = 'file-tree-btn file-tree-cd';
+    cdBtn.title = '터미널에서 이 경로로 이동';
+    cdBtn.textContent = '▸';
+
+    actionsRight.append(refreshBtn, cdBtn);
+    actions.append(actionsLeft, actionsRight);
+
+    // 주소창 줄
     const cwdWrap = document.createElement('div');
     cwdWrap.className = 'file-tree-cwd-wrap';
 
@@ -433,12 +454,7 @@ const fileTreeView = {
 
     cwdWrap.append(cwdInput, suggest);
 
-    const cdBtn = document.createElement('button');
-    cdBtn.className = 'file-tree-cd';
-    cdBtn.title = '터미널에서 이 경로로 이동';
-    cdBtn.textContent = 'cd';
-
-    pathBar.append(upBtn, refreshBtn, hiddenBtn, cwdWrap, cdBtn);
+    pathBar.append(actions, cwdWrap);
 
     const list = document.createElement('div');
     list.className = 'file-tree-list';
@@ -522,6 +538,21 @@ const fileTreeView = {
 
       if (e.key === 'Enter') {
         e.preventDefault();
+        // 자동완성 항목이 선택돼 있으면 그걸 우선 적용
+        if (this._suggestItems.length > 0 && this._suggestSelected >= 0) {
+          const pick = this._suggestItems[this._suggestSelected];
+          const target = pick.path;
+          if (pick.is_dir) {
+            // 폴더면 바로 이동
+            const ok = await this._tryNavigate(target);
+            if (!ok) this._shake();
+          } else {
+            // 파일이면 input에 채워넣기만
+            cwdInput.value = target;
+            this._hideSuggest();
+          }
+          return;
+        }
         const expanded = await this._expandPath(cwdInput.value.trim());
         if (!expanded) return;
         const ok = await this._tryNavigate(expanded);
@@ -554,8 +585,17 @@ const fileTreeView = {
       }
     });
 
-    // 자동완성 패널: blur 방지 + 항목 선택
+    // 자동완성 패널: blur 방지 + 마우스 hover로 선택 이동 + 클릭 적용
     suggest.addEventListener('mousedown', (e) => e.preventDefault());
+    suggest.addEventListener('mousemove', (e) => {
+      const item = e.target.closest('.file-tree-suggest-item');
+      if (!item) return;
+      const idx = Number(item.dataset.idx);
+      if (idx !== this._suggestSelected) {
+        this._suggestSelected = idx;
+        this._renderSuggestSelection();
+      }
+    });
     suggest.addEventListener('click', (e) => {
       const item = e.target.closest('.file-tree-suggest-item');
       if (!item) return;
