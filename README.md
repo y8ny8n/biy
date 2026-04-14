@@ -1,8 +1,6 @@
-# biy
+# termy
 
 AI-integrated terminal emulator for macOS.
-
-Big Bang + Yoon = **biy**
 
 ## Features
 
@@ -79,7 +77,7 @@ cargo tauri build --debug
 
 ### Run
 ```bash
-open src-tauri/target/debug/bundle/macos/biy.app
+open src-tauri/target/debug/bundle/macos/termy.app
 ```
 
 ## License

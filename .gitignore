@@ -6,7 +6,7 @@ dist/
 src-tauri/target/
 
 # SwiftUI
-biy-settings/.build/
+termy-settings/.build/
 
 # macOS
 .DS_Store

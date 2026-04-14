@@ -1,5 +1,5 @@
 [package]
-name = "biy"
+name = "termy"
 version = "0.2.0"
 description = "AI-integrated terminal emulator"
 authors = ["kyoungyoon"]
@@ -7,7 +7,7 @@ license = "MIT"
 edition = "2021"
 
 [lib]
-name = "biy_lib"
+name = "termy_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

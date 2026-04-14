@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "biy",
+  "productName": "termy",
   "version": "0.2.0",
-  "identifier": "com.biy.terminal",
+  "identifier": "com.termy.terminal",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "biy",
+        "title": "termy",
         "width": 900,
         "height": 600,
         "minWidth": 500,

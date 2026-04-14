@@ -1,6 +1,6 @@
 import Foundation
 
-struct BiyConfig {
+struct TermyConfig {
     var fontSize: Double = 16.0
     var windowWidth: Int = 820
     var windowHeight: Int = 560
@@ -13,17 +13,17 @@ struct BiyConfig {
 
     static var configPath: URL {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return appSupport.appendingPathComponent("biy/config.toml")
+        return appSupport.appendingPathComponent("termy/config.toml")
     }
 
     // ~/Library/Application Support 와 ~/.config 둘 다 체크
     static var configPathAlt: URL {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        return home.appendingPathComponent(".config/biy/config.toml")
+        return home.appendingPathComponent(".config/termy/config.toml")
     }
 
     static func findConfigPath() -> URL {
-        // ~/.config/biy/config.toml 우선
+        // ~/.config/termy/config.toml 우선
         let alt = configPathAlt
         if FileManager.default.fileExists(atPath: alt.path) {
             return alt
@@ -32,13 +32,13 @@ struct BiyConfig {
         if FileManager.default.fileExists(atPath: primary.path) {
             return primary
         }
-        // 기본: ~/.config/biy/config.toml 생성
+        // 기본: ~/.config/termy/config.toml 생성
         return alt
     }
 
-    static func load() -> BiyConfig {
+    static func load() -> TermyConfig {
         let path = findConfigPath()
-        var config = BiyConfig()
+        var config = TermyConfig()
 
         guard let content = try? String(contentsOf: path, encoding: .utf8) else {
             return config
@@ -83,7 +83,7 @@ struct BiyConfig {
     }
 
     func save() {
-        let path = BiyConfig.findConfigPath()
+        let path = TermyConfig.findConfigPath()
         let dir = path.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
@@ -144,7 +144,7 @@ struct SshConnection: Codable, Identifiable {
 
 func sshConfigPath() -> URL {
     let home = FileManager.default.homeDirectoryForCurrentUser
-    return home.appendingPathComponent(".config/biy/ssh_connections.json")
+    return home.appendingPathComponent(".config/termy/ssh_connections.json")
 }
 
 // ── 테마 프리셋 ──
@@ -157,7 +157,7 @@ struct Theme {
 }
 
 let THEMES: [Theme] = [
-    Theme(name: "biy Dark",     bg: "#0D1117", fg: "#D9D9D9", cursor: "#5A5A6A"),
+    Theme(name: "termy Dark",   bg: "#0D1117", fg: "#D9D9D9", cursor: "#5A5A6A"),
     Theme(name: "Dracula",      bg: "#282A36", fg: "#F8F8F2", cursor: "#BD93F9"),
     Theme(name: "Nord",         bg: "#2E3440", fg: "#D8DEE9", cursor: "#88C0D0"),
     Theme(name: "Solarized Dark", bg: "#002B36", fg: "#839496", cursor: "#268BD2"),

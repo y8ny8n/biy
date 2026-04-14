@@ -171,23 +171,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "biy"
-version = "0.2.0"
-dependencies = [
- "dirs",
- "log",
- "portable-pty",
- "serde",
- "serde_json",
- "ssh2",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-log",
- "tauri-plugin-shell",
-]
-
-[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4199,6 +4182,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5d9cf598a6d7ce700a4e6a9199da127e6819a61e64b68609683cc9a01b5683a"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "termy"
+version = "0.2.0"
+dependencies = [
+ "dirs",
+ "log",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "ssh2",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-log",
+ "tauri-plugin-shell",
 ]
 
 [[package]]

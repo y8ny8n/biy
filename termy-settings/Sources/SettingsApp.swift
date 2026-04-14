@@ -2,11 +2,11 @@ import SwiftUI
 import AppKit
 
 @main
-struct BiySettingsApp: App {
+struct TermySettingsApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
-        Window("biy 환경설정", id: "settings") {
+        Window("termy 환경설정", id: "settings") {
             SettingsView()
                 .frame(minWidth: 600, minHeight: 450)
         }
@@ -55,7 +55,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 }
 
 struct SettingsView: View {
-    @State private var config = BiyConfig.load()
+    @State private var config = TermyConfig.load()
     @State private var selectedSection: SettingsSection? = .appearance
     @State private var saved = false
 
@@ -312,7 +312,7 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("설정 파일")
                         .foregroundStyle(.secondary)
-                    Text(BiyConfig.findConfigPath().path)
+                    Text(TermyConfig.findConfigPath().path)
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.tertiary)
                         .textSelection(.enabled)
@@ -393,7 +393,7 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("사용 방법")
                         .font(.headline)
-                    Text("biy 터미널에서 ⌘+Shift+N 으로 SSH 연결을 선택할 수 있습니다")
+                    Text("termy 터미널에서 ⌘+Shift+N 으로 SSH 연결을 선택할 수 있습니다")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

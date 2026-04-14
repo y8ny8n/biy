@@ -2,11 +2,11 @@
 import PackageDescription
 
 let package = Package(
-    name: "biy-settings",
+    name: "termy-settings",
     platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
-            name: "biy-settings",
+            name: "termy-settings",
             path: "Sources"
         )
     ]

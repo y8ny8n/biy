@@ -197,7 +197,7 @@ async function createTab(type = 'local', sshConfig = null) {
     console.log('PTY created:', ptyId);
   } catch (e) {
     console.error('PTY creation failed:', e);
-    term.writeln(`\r\n\x1b[31m[biy] PTY 생성 실패: ${e}\x1b[0m`);
+    term.writeln(`\r\n\x1b[31m[termy] PTY 생성 실패: ${e}\x1b[0m`);
     term.writeln(`\r\n\x1b[33m개발자 도구: ⌘+Option+I\x1b[0m`);
     tab.alive = false;
   }
@@ -352,7 +352,7 @@ function renderTabBar() {
   const activeTab = tabs.find(t => t.id === activeTabId);
   if (activeTab) {
     const prefix = tabs.length > 1 ? `[${tabs.indexOf(activeTab) + 1}/${tabs.length}] ` : '';
-    getCurrentWindow().setTitle(`${prefix}${activeTab.title} — biy`);
+    getCurrentWindow().setTitle(`${prefix}${activeTab.title} — termy`);
   }
 
   // 세션 목록 갱신
@@ -913,7 +913,7 @@ function getPwdFromTerminal(tabId) {
     });
 
     // 특수 마커를 포함한 pwd 실행 (결과 파싱을 쉽게)
-    await invoke('pty_write', { id: tabId, data: '\x15echo "::BIY_PWD::$(pwd)::BIY_END::"\r' });
+    await invoke('pty_write', { id: tabId, data: '\x15echo "::TERMY_PWD::$(pwd)::TERMY_END::"\r' });
 
     // 결과 대기
     setTimeout(() => {
@@ -922,7 +922,7 @@ function getPwdFromTerminal(tabId) {
 
       const output = buffer.join('');
       // 마커 사이의 경로 추출
-      const match = output.match(/::BIY_PWD::(.+?)::BIY_END::/);
+      const match = output.match(/::TERMY_PWD::(.+?)::TERMY_END::/);
       if (match) {
         resolve(match[1].trim());
       } else {
@@ -1035,10 +1035,19 @@ listen('pty-output', (event) => {
   }
 }).then(() => console.log('Listening for pty-output'));
 
+listen('pty-error', (event) => {
+  const { id, error } = event.payload;
+  console.error('PTY error:', id, error);
+  let tab = tabs.find(t => t.id === id);
+  if (tab) {
+    tab.term.writeln(`\r\n\x1b[31m[termy] ${error}\x1b[0m`);
+  }
+}).then(() => console.log('Listening for pty-error'));
+
 listen('pty-exit', (event) => {
   const { id } = event.payload;
   console.log('PTY exit:', id);
-  const tab = tabs.find(t => t.id === id);
+  let tab = tabs.find(t => t.id === id);
   if (tab) {
     tab.alive = false;
     tab.title += ' (종료됨)';
@@ -1261,7 +1270,7 @@ document.querySelectorAll('.sidebar-tab').forEach(tab => {
 // ── 테마 데이터 ──
 
 const THEMES = [
-  { name: 'biy Navy', bg: '#1a1a2e', fg: '#d4d8e8', cursor: '#0078d4',
+  { name: 'termy Navy', bg: '#1a1a2e', fg: '#d4d8e8', cursor: '#0078d4',
     ansi: {
       black: '#0f0f1a', red: '#e05561', green: '#43d08a', yellow: '#e6c07b',
       blue: '#0078d4', magenta: '#c678dd', cyan: '#56b6c2', white: '#d4d8e8',
@@ -1271,7 +1280,7 @@ const THEMES = [
       selectionBackground: '#0078d450',
     }
   },
-  { name: 'biy Dark', bg: '#0d1117', fg: '#d9d9d9', cursor: '#58a6ff' },
+  { name: 'termy Dark', bg: '#0d1117', fg: '#d9d9d9', cursor: '#58a6ff' },
   { name: 'Dracula', bg: '#282a36', fg: '#f8f8f2', cursor: '#bd93f9' },
   { name: 'Nord', bg: '#2e3440', fg: '#d8dee9', cursor: '#88c0d0' },
   { name: 'Monokai', bg: '#272822', fg: '#f8f8f2', cursor: '#f92672' },
