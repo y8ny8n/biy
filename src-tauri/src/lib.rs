@@ -170,6 +170,7 @@ fn create_ssh_pty(
     match create_sftp_session(&config) {
         Ok(sftp_session) => {
             // 홈 디렉토리 가져오기
+            sftp_session.set_timeout(30_000);
             sftp_session.set_blocking(true);
             let cwd = (|| -> Option<String> {
                 let mut ch = sftp_session.channel_session().ok()?;
@@ -193,6 +194,10 @@ fn create_ssh_pty(
         }
         Err(e) => {
             log::warn!("SFTP session failed: {} (file tree won't work)", e);
+            let _ = app.emit("pty-error", serde_json::json!({
+                "id": id,
+                "error": format!("파일 트리 연결 실패: {}", e),
+            }));
         }
     }
 
@@ -212,6 +217,11 @@ fn create_ssh_pty(
             Ok(_) => {}
             Err(e) => {
                 log::error!("SSH error: {}", e);
+                let error_msg = format!("{}", e);
+                let _ = app_clone.emit("pty-error", serde_json::json!({
+                    "id": id,
+                    "error": error_msg,
+                }));
                 let _ = app_clone.emit("pty-exit", serde_json::json!({ "id": id }));
             }
         }
@@ -229,37 +239,54 @@ fn create_sftp_session(config: &SshConfig) -> Result<ssh2::Session, Box<dyn std:
     use std::net::TcpStream;
 
     let addr = format!("{}:{}", config.host, config.port);
-    let tcp = TcpStream::connect(&addr)?;
+    let socket_addr: std::net::SocketAddr = addr.parse()
+        .or_else(|_| {
+            use std::net::ToSocketAddrs;
+            addr.to_socket_addrs()?.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "DNS 실패"))
+        })?;
+    let tcp = TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_secs(10))?;
+    tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
 
     let mut session = ssh2::Session::new()?;
     session.set_tcp_stream(tcp);
     session.handshake()?;
+    session.set_keepalive(true, 30);
+    session.set_timeout(30_000);
 
     // 인증 (ssh_session과 동일 로직)
     let mut authenticated = false;
+    let is_password_mode = config.auth_type.eq_ignore_ascii_case("password");
 
-    if let Ok(mut agent) = session.agent() {
-        if agent.connect().is_ok() {
-            let _ = agent.list_identities();
-            if let Ok(identities) = agent.identities() {
-                for identity in &identities {
-                    if agent.userauth(&config.username, identity).is_ok() && session.authenticated() {
-                        authenticated = true;
-                        break;
+    if !is_password_mode {
+        if let Ok(mut agent) = session.agent() {
+            if agent.connect().is_ok() {
+                let _ = agent.list_identities();
+                if let Ok(identities) = agent.identities() {
+                    for identity in &identities {
+                        if agent.userauth(&config.username, identity).is_ok() && session.authenticated() {
+                            authenticated = true;
+                            break;
+                        }
                     }
                 }
             }
         }
-    }
 
-    if !authenticated {
-        let home = std::env::var("HOME").unwrap_or_default();
-        for key in &["id_ed25519", "id_rsa", "id_ecdsa"] {
-            let path = std::path::PathBuf::from(&home).join(".ssh").join(key);
-            if path.exists() {
-                if session.userauth_pubkey_file(&config.username, None, &path, None).is_ok()
-                    && session.authenticated()
-                {
+        // 사용자 지정 키 경로 우선 시도 (프롬프트 허용)
+        if !authenticated && !config.key_path.trim().is_empty() {
+            let path = expand_path(&config.key_path);
+            if path.exists() && try_key_auth(&session, &config.username, &path, true) {
+                authenticated = true;
+            }
+        }
+
+        // 기본 키는 passphrase 없이만 조용히 시도
+        if !authenticated {
+            let home = std::env::var("HOME").unwrap_or_default();
+            for key in &["id_ed25519", "id_rsa", "id_ecdsa"] {
+                let path = std::path::PathBuf::from(&home).join(".ssh").join(key);
+                if path.exists() && try_key_auth(&session, &config.username, &path, false) {
                     authenticated = true;
                     break;
                 }
@@ -267,7 +294,7 @@ fn create_sftp_session(config: &SshConfig) -> Result<ssh2::Session, Box<dyn std:
         }
     }
 
-    if !authenticated {
+    if !authenticated && !config.auth_type.eq_ignore_ascii_case("key") {
         if let Some(password) = keychain_get_password(&config.host, &config.username) {
             if session.userauth_password(&config.username, &password).is_ok() {
                 authenticated = true;
@@ -293,39 +320,61 @@ fn ssh_session(
     use std::net::TcpStream;
 
     let addr = format!("{}:{}", config.host, config.port);
-    let tcp = TcpStream::connect(&addr)?;
+    let socket_addr: std::net::SocketAddr = addr.parse()
+        .or_else(|_| {
+            use std::net::ToSocketAddrs;
+            addr.to_socket_addrs()?.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "DNS 실패"))
+        })
+        .map_err(|e| -> Box<dyn std::error::Error> {
+            format!("호스트를 찾을 수 없음: {} ({})", addr, e).into()
+        })?;
+    let tcp = TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_secs(10))
+        .map_err(|e| -> Box<dyn std::error::Error> {
+            format!("서버에 연결할 수 없음: {} ({})", addr, e).into()
+        })?;
 
     let mut session = ssh2::Session::new()?;
     session.set_tcp_stream(tcp);
-    session.handshake()?;
+    session.handshake().map_err(|e| -> Box<dyn std::error::Error> {
+        format!("SSH 핸드셰이크 실패: {}", e).into()
+    })?;
+    session.set_keepalive(true, 30);
+    session.set_timeout(30_000);
 
     // 인증
     let mut authenticated = false;
+    let is_password_mode = config.auth_type.eq_ignore_ascii_case("password");
 
-    // 1. ssh-agent
-    if let Ok(mut agent) = session.agent() {
-        if agent.connect().is_ok() {
-            let _ = agent.list_identities();
-            if let Ok(identities) = agent.identities() {
-                for identity in &identities {
-                    if agent.userauth(&config.username, identity).is_ok() && session.authenticated() {
-                        authenticated = true;
-                        break;
+    if !is_password_mode {
+        // 1. ssh-agent
+        if let Ok(mut agent) = session.agent() {
+            if agent.connect().is_ok() {
+                let _ = agent.list_identities();
+                if let Ok(identities) = agent.identities() {
+                    for identity in &identities {
+                        if agent.userauth(&config.username, identity).is_ok() && session.authenticated() {
+                            authenticated = true;
+                            break;
+                        }
                     }
                 }
             }
         }
-    }
 
-    // 2. 키 파일
-    if !authenticated {
-        let home = std::env::var("HOME").unwrap_or_default();
-        for key in &["id_ed25519", "id_rsa", "id_ecdsa"] {
-            let path = std::path::PathBuf::from(&home).join(".ssh").join(key);
-            if path.exists() {
-                if session.userauth_pubkey_file(&config.username, None, &path, None).is_ok()
-                    && session.authenticated()
-                {
+        // 2. 사용자 지정 키 경로 우선 (프롬프트 허용)
+        if !authenticated && !config.key_path.trim().is_empty() {
+            let path = expand_path(&config.key_path);
+            if path.exists() && try_key_auth(&session, &config.username, &path, true) {
+                authenticated = true;
+            }
+        }
+
+        // 3. 기본 키 파일 (passphrase 없이만 조용히)
+        if !authenticated {
+            let home = std::env::var("HOME").unwrap_or_default();
+            for key in &["id_ed25519", "id_rsa", "id_ecdsa"] {
+                let path = std::path::PathBuf::from(&home).join(".ssh").join(key);
+                if path.exists() && try_key_auth(&session, &config.username, &path, false) {
                     authenticated = true;
                     break;
                 }
@@ -333,8 +382,9 @@ fn ssh_session(
         }
     }
 
-    // 3. 키체인 비밀번호
-    if !authenticated {
+    // 3. 키체인 비밀번호 (key 모드면 건너뜀)
+    let is_key_mode = config.auth_type.eq_ignore_ascii_case("key");
+    if !authenticated && !is_key_mode {
         if let Some(password) = keychain_get_password(&config.host, &config.username) {
             if session.userauth_password(&config.username, &password).is_ok() && session.authenticated() {
                 authenticated = true;
@@ -342,8 +392,8 @@ fn ssh_session(
         }
     }
 
-    // 4. 비밀번호 프롬프트
-    if !authenticated {
+    // 4. 비밀번호 프롬프트 (key 모드면 건너뜀)
+    if !authenticated && !is_key_mode {
         if let Some(password) = prompt_password(&config.host, &config.username) {
             session.userauth_password(&config.username, &password)?;
             if session.authenticated() {
@@ -366,11 +416,15 @@ fn ssh_session(
     let mut buf = [0u8; 8192];
     let mut osc_state: u8 = 0;
     let mut osc_buf: Vec<u8> = Vec::new();
+    let mut last_keepalive = std::time::Instant::now();
+    let mut consecutive_errors: u32 = 0;
+    let mut disconnect_reason: Option<String> = None;
 
     loop {
         match channel.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                consecutive_errors = 0;
                 let data = &buf[..n];
 
                 // OSC 타이틀 파싱
@@ -404,8 +458,22 @@ fn ssh_session(
                     "data": data.to_vec(),
                 }));
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => break,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                consecutive_errors = 0;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                consecutive_errors += 1;
+                if consecutive_errors >= 3 {
+                    log::warn!("SSH tab {}: 연속 타임아웃 {}회, 연결 종료", id, consecutive_errors);
+                    disconnect_reason = Some("서버 응답 없음 (타임아웃)".to_string());
+                    break;
+                }
+            }
+            Err(e) => {
+                log::warn!("SSH tab {}: read 에러: {}", id, e);
+                disconnect_reason = Some(format!("연결 끊김: {}", e));
+                break;
+            }
         }
 
         // 입력/리사이즈 수신
@@ -422,16 +490,122 @@ fn ssh_session(
         }
 
         if channel.eof() { break; }
+
+        // keepalive 전송 (30초마다)
+        if last_keepalive.elapsed() >= std::time::Duration::from_secs(30) {
+            if let Err(e) = session.keepalive_send() {
+                log::warn!("SSH tab {}: keepalive 실패: {}", id, e);
+                disconnect_reason = Some(format!("keepalive 실패: {}", e));
+                break;
+            }
+            last_keepalive = std::time::Instant::now();
+        }
+
         thread::sleep(std::time::Duration::from_millis(10));
     }
 
+    if let Some(reason) = disconnect_reason {
+        let _ = app.emit("pty-error", serde_json::json!({
+            "id": id,
+            "error": reason,
+        }));
+    }
     let _ = app.emit("pty-exit", serde_json::json!({ "id": id }));
     Ok(())
 }
 
+/// ~ 또는 $HOME 확장
+fn expand_path(p: &str) -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let trimmed = p.trim();
+    if trimmed.is_empty() {
+        return std::path::PathBuf::new();
+    }
+    let expanded = if trimmed == "~" {
+        home.clone()
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        format!("{}/{}", home, rest)
+    } else if trimmed.contains("$HOME") {
+        trimmed.replace("$HOME", &home)
+    } else {
+        trimmed.to_string()
+    };
+    std::path::PathBuf::from(expanded)
+}
+
+/// 키 파일 인증. `interactive=true`일 때만 passphrase 프롬프트를 띄움.
+fn try_key_auth(
+    session: &ssh2::Session,
+    username: &str,
+    path: &std::path::Path,
+    interactive: bool,
+) -> bool {
+    if let Err(e) = std::fs::metadata(path) {
+        log::warn!("키 파일 접근 실패 {}: {}", path.display(), e);
+        return false;
+    }
+    match session.userauth_pubkey_file(username, None, path, None) {
+        Ok(_) if session.authenticated() => return true,
+        Ok(_) => {}
+        Err(e) => log::info!("키 인증 None passphrase 실패 {}: {}", path.display(), e),
+    }
+    let key_id = path.to_string_lossy().to_string();
+    if let Some(pp) = keychain_get_key_passphrase(&key_id) {
+        if session.userauth_pubkey_file(username, None, path, Some(&pp)).is_ok()
+            && session.authenticated()
+        {
+            return true;
+        }
+    }
+    if !interactive {
+        return false;
+    }
+    if let Some(pp) = prompt_key_passphrase(&key_id) {
+        if session.userauth_pubkey_file(username, None, path, Some(&pp)).is_ok()
+            && session.authenticated()
+        {
+            keychain_save_key_passphrase(&key_id, &pp);
+            return true;
+        }
+    }
+    false
+}
+
+fn keychain_get_key_passphrase(key_id: &str) -> Option<String> {
+    let output = std::process::Command::new("security")
+        .args(["find-generic-password", "-a", key_id, "-s", "termy-sshkey", "-w"])
+        .output().ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else { None }
+}
+
+fn keychain_save_key_passphrase(key_id: &str, passphrase: &str) {
+    let _ = std::process::Command::new("security")
+        .args(["delete-generic-password", "-a", key_id, "-s", "termy-sshkey"])
+        .output();
+    let _ = std::process::Command::new("security")
+        .args(["add-generic-password", "-a", key_id, "-s", "termy-sshkey", "-w", passphrase])
+        .output();
+}
+
+fn prompt_key_passphrase(key_id: &str) -> Option<String> {
+    let safe_key = key_id.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        r#"display dialog "키 passphrase ({}):" default answer "" with hidden answer with title "termy SSH" buttons {{"취소", "확인"}} default button "확인""#,
+        safe_key
+    );
+    let output = std::process::Command::new("osascript")
+        .args(["-e", &script]).output().ok()?;
+    if !output.status.success() { return None; }
+    String::from_utf8_lossy(&output.stdout)
+        .split("text returned:").nth(1)
+        .map(|s| s.trim().to_string())
+}
+
 fn keychain_get_password(host: &str, username: &str) -> Option<String> {
     let output = std::process::Command::new("security")
-        .args(["find-generic-password", "-a", username, "-s", &format!("biy-ssh-{}", host), "-w"])
+        .args(["find-generic-password", "-a", username, "-s", &format!("termy-ssh-{}", host), "-w"])
         .output().ok()?;
     if output.status.success() {
         Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -440,10 +614,10 @@ fn keychain_get_password(host: &str, username: &str) -> Option<String> {
 
 fn keychain_save_password(host: &str, username: &str, password: &str) {
     let _ = std::process::Command::new("security")
-        .args(["delete-generic-password", "-a", username, "-s", &format!("biy-ssh-{}", host)])
+        .args(["delete-generic-password", "-a", username, "-s", &format!("termy-ssh-{}", host)])
         .output();
     let _ = std::process::Command::new("security")
-        .args(["add-generic-password", "-a", username, "-s", &format!("biy-ssh-{}", host), "-w", password])
+        .args(["add-generic-password", "-a", username, "-s", &format!("termy-ssh-{}", host), "-w", password])
         .output();
 }
 
@@ -452,7 +626,7 @@ fn prompt_password(host: &str, username: &str) -> Option<String> {
     let safe_user = username.replace('\\', "\\\\").replace('"', "\\\"");
     let safe_host = host.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!(
-        r#"display dialog "{}@{} 비밀번호:" default answer "" with hidden answer with title "biy SSH" buttons {{"취소", "연결"}} default button "연결""#,
+        r#"display dialog "{}@{} 비밀번호:" default answer "" with hidden answer with title "termy SSH" buttons {{"취소", "연결"}} default button "연결""#,
         safe_user, safe_host
     );
     let output = std::process::Command::new("osascript")
@@ -524,6 +698,7 @@ fn sftp_list_dir(id: u32, path: Option<String>, state: State<'_, PtyState>) -> R
     let mut mgr = state.lock().map_err(|e| e.to_string())?;
     let sftp_handle = mgr.sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
 
+    sftp_handle.session.set_timeout(30_000);
     sftp_handle.session.set_blocking(true);
     let dir_path = path.unwrap_or_else(|| sftp_handle.cwd.clone());
     let sftp = sftp_handle.session.sftp().map_err(|e| e.to_string())?;
@@ -570,6 +745,7 @@ fn sftp_sync_cwd(id: u32, state: State<'_, PtyState>) -> Result<String, String> 
     let mut mgr = state.lock().map_err(|e| e.to_string())?;
     let sftp_handle = mgr.sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
 
+    sftp_handle.session.set_timeout(30_000);
     sftp_handle.session.set_blocking(true);
     let result = (|| -> Result<String, Box<dyn std::error::Error>> {
         let mut channel = sftp_handle.session.channel_session()?;
@@ -614,6 +790,7 @@ fn sftp_download(id: u32, remote_path: String, local_path: String, state: State<
             let mut mgr = state_clone.lock().map_err(|e| e.to_string())?;
             let sftp_handle = mgr.sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
 
+            sftp_handle.session.set_timeout(60_000);
             sftp_handle.session.set_blocking(true);
             let transfer_result = (|| -> Result<(), String> {
                 let sftp = sftp_handle.session.sftp().map_err(|e| e.to_string())?;
@@ -699,6 +876,7 @@ fn sftp_upload(id: u32, local_path: String, remote_path: String, state: State<'_
             let mut mgr = state_clone.lock().map_err(|e| e.to_string())?;
             let sftp_handle = mgr.sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
 
+            sftp_handle.session.set_timeout(60_000);
             sftp_handle.session.set_blocking(true);
             let transfer_result = (|| -> Result<(), String> {
                 let sftp = sftp_handle.session.sftp().map_err(|e| e.to_string())?;
@@ -821,7 +999,7 @@ fn local_list_dir(path: String, show_hidden: Option<bool>) -> Result<Vec<FileEnt
 fn get_ssh_connections() -> Vec<SshConfig> {
     let path = dirs::home_dir()
         .unwrap_or_default()
-        .join(".config/biy/ssh_connections.json");
+        .join(".config/termy/ssh_connections.json");
     if let Ok(data) = std::fs::read_to_string(&path) {
         serde_json::from_str(&data).unwrap_or_default()
     } else {
@@ -834,6 +1012,7 @@ fn get_ssh_connections() -> Vec<SshConfig> {
 fn sftp_delete(id: u32, remote_path: String, is_dir: bool, state: State<'_, PtyState>) -> Result<(), String> {
     let mut mgr = state.lock().map_err(|e| e.to_string())?;
     let sftp_handle = mgr.sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
+    sftp_handle.session.set_timeout(30_000);
     sftp_handle.session.set_blocking(true);
     let result = (|| -> Result<(), String> {
         let sftp = sftp_handle.session.sftp().map_err(|e| e.to_string())?;
@@ -854,6 +1033,7 @@ fn sftp_delete(id: u32, remote_path: String, is_dir: bool, state: State<'_, PtyS
 fn sftp_rename(id: u32, old_path: String, new_path: String, state: State<'_, PtyState>) -> Result<(), String> {
     let mut mgr = state.lock().map_err(|e| e.to_string())?;
     let sftp_handle = mgr.sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
+    sftp_handle.session.set_timeout(30_000);
     sftp_handle.session.set_blocking(true);
     let result = (|| -> Result<(), String> {
         let sftp = sftp_handle.session.sftp().map_err(|e| e.to_string())?;
@@ -888,7 +1068,7 @@ fn local_rename(old_path: String, new_path: String) -> Result<(), String> {
 fn save_app_settings(settings: serde_json::Value) -> Result<(), String> {
     let path = dirs::home_dir()
         .unwrap_or_default()
-        .join(".config/biy/settings.json");
+        .join(".config/termy/settings.json");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -902,7 +1082,7 @@ fn save_app_settings(settings: serde_json::Value) -> Result<(), String> {
 fn load_app_settings() -> Result<serde_json::Value, String> {
     let path = dirs::home_dir()
         .unwrap_or_default()
-        .join(".config/biy/settings.json");
+        .join(".config/termy/settings.json");
     if path.exists() {
         let data = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
         serde_json::from_str(&data).map_err(|e| e.to_string())
@@ -923,7 +1103,7 @@ fn save_password_to_keychain(host: String, username: String, password: String) -
 fn save_ssh_connections(connections: Vec<SshConfig>) -> Result<(), String> {
     let path = dirs::home_dir()
         .unwrap_or_default()
-        .join(".config/biy/ssh_connections.json");
+        .join(".config/termy/ssh_connections.json");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -940,13 +1120,13 @@ fn open_settings() {
         .unwrap()
         .to_path_buf();
 
-    let settings_path = base.join("biy-settings/.build/debug/biy-settings");
+    let settings_path = base.join("termy-settings/.build/debug/termy-settings");
 
     if settings_path.exists() {
         let _ = std::process::Command::new(&settings_path).spawn();
     } else {
         // 빌드 안 되어 있으면 빌드 후 실행
-        let settings_dir = base.join("biy-settings");
+        let settings_dir = base.join("termy-settings");
         let _ = std::process::Command::new("swift")
             .args(["build"])
             .current_dir(&settings_dir)
@@ -958,7 +1138,42 @@ fn open_settings() {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// biy → termy 마이그레이션 (1회성)
+/// ~/.config/biy/* → ~/.config/termy/* 로 복사 (termy 디렉터리가 비어있을 때만)
+fn migrate_from_biy() {
+    let Some(home) = dirs::home_dir() else { return };
+    let old_dir = home.join(".config/biy");
+    let new_dir = home.join(".config/termy");
+
+    if !old_dir.exists() {
+        return;
+    }
+    if new_dir.exists() && std::fs::read_dir(&new_dir).map(|mut d| d.next().is_some()).unwrap_or(false) {
+        // termy 디렉터리에 이미 파일이 있으면 덮어쓰지 않음
+        return;
+    }
+
+    if let Err(e) = std::fs::create_dir_all(&new_dir) {
+        log::warn!("migrate: create_dir_all 실패: {}", e);
+        return;
+    }
+
+    for entry in std::fs::read_dir(&old_dir).into_iter().flatten().flatten() {
+        let src = entry.path();
+        let Some(file_name) = src.file_name() else { continue };
+        let dst = new_dir.join(file_name);
+        if src.is_file() {
+            if let Err(e) = std::fs::copy(&src, &dst) {
+                log::warn!("migrate: copy 실패 {:?}: {}", src, e);
+            } else {
+                log::info!("migrate: {:?} → {:?}", src, dst);
+            }
+        }
+    }
+}
+
 pub fn run() {
+    migrate_from_biy();
     tauri::Builder::default()
         .manage(Arc::new(Mutex::new(PtyManager {
             ptys: HashMap::new(),
