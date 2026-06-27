@@ -146,3 +146,21 @@
 - 드래그 다운로드(앱→Finder): Tauri WKWebView가 드래그아웃(DownloadURL/파일프로미스) 미지원 → 네이티브 작업 필요, 별도 스코프로 보류
 
 ---
+
+## 2026-06-28 01:00 ~ 01:11 (약 11분)
+
+### 요청
+- SSH에서 su 등으로 계정 전환 시 SFTP 파일트리도 그 계정 경로를 따라가게
+
+### 처리 결과
+- 배경: SFTP 세션은 항상 접속 유저로 인증됨(su 안 됨). 단 접속 유저가 대상 계정 파일을 읽을 수 있으면(권한 OK) SFTP가 그 경로를 볼 수 있음. 따라서 필요한 건 "su 후 트리가 그 경로로 자동 이동"
+- 변경 파일: `src/main.js`
+- trackShellSwitch() 추가: pty-output(에코된 명령)에서 `프롬프트 + su/sudo -i/sudo su/bash/zsh...` 감지 → OSC7 훅 재주입 대기
+  - 같은 호스트 fs 셸만 대상(ssh/docker exec 제외)
+  - 비밀번호 프롬프트(Password/passphrase/암호) 감지 시 대기 → 설정 명령이 비번으로 들어가는 사고 방지
+  - 출력이 잠잠해지면(프롬프트 표시 완료) 900ms 디바운스 후 injectSshInit 재호출(suppression으로 잔상도 숨김)
+  - 20초 안전 타임아웃
+- 정규식 sanity 8케이스 통과(su/sudo-su/sudo -i/bash 감지, ls/systemctl/ssh/echo sudo 미감지)
+- 검증: esbuild 번들 + tauri build 성공, 앱 정상 실행. 실제 su 추적은 실서버 필요 — 코드/빌드 레벨 확인
+
+---

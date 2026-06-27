@@ -929,6 +929,41 @@ function injectSshInit(id) {
   }, 1000);
 }
 
+// su/sudo/중첩 셸 전환 감지 → OSC7 훅 재주입 (su 후에도 트리가 cd를 따라가게).
+// su - 는 새 로그인 셸이라 기존 훅이 사라지므로, 새 셸에 훅을 다시 심는다.
+// 같은 호스트 파일시스템을 공유하는 셸만 대상 (ssh/docker exec 등 다른 fs는 제외).
+const SHELL_SWITCH_RE = /[$#%]\s+(?:su\b|sudo\s+(?:-i|-s|su|bash|zsh|sh)\b|bash\b|zsh\b|dash\b|ksh\b)/;
+
+function trackShellSwitch(tab, arr) {
+  if (!tab || tab.type !== 'ssh') return;
+  let text = '';
+  for (let i = 0; i < arr.length; i++) text += String.fromCharCode(arr[i]);
+
+  // 셸 전환 명령 에코를 보면 재주입 대기 시작
+  if (SHELL_SWITCH_RE.test(text)) tab._reinjectPending = Date.now();
+  if (!tab._reinjectPending) return;
+
+  // 20초 넘게 안 잠잠해지면 포기
+  if (Date.now() - tab._reinjectPending > 20000) {
+    tab._reinjectPending = 0;
+    clearTimeout(tab._reinjectTimer);
+    return;
+  }
+  // 비밀번호 프롬프트가 보이면 입력이 끝날 때까지 대기 (설정 명령이 비번으로 들어가는 사고 방지)
+  if (/[Pp]assword|[Pp]assphrase|암호/.test(text)) {
+    clearTimeout(tab._reinjectTimer);
+    return;
+  }
+  // 출력이 잠잠해지면(프롬프트 표시 완료) 훅 재주입
+  clearTimeout(tab._reinjectTimer);
+  tab._reinjectTimer = setTimeout(() => {
+    if (tab._reinjectPending) {
+      tab._reinjectPending = 0;
+      injectSshInit(tab.id);
+    }
+  }, 900);
+}
+
 // SSH 터미널에서 pwd 실행 후 경로 반환
 function getPwdFromTerminal(tabId) {
   return new Promise(async (resolve) => {
@@ -1078,6 +1113,7 @@ listen('pty-output', (event) => {
     return;
   }
   tab.term.write(arr);
+  trackShellSwitch(tab, arr);
 }).then(() => console.log('Listening for pty-output'));
 
 listen('pty-error', (event) => {
