@@ -35,14 +35,17 @@ struct SftpHandle {
     cwd: String,
 }
 
-/// 전체 PTY + SFTP 관리
+/// PTY + SSH 입력 관리 (터미널 경로)
 struct PtyManager {
     ptys: HashMap<u32, PtyHandle>,
     ssh_inputs: HashMap<u32, SshInputSender>,
-    sftps: HashMap<u32, SftpHandle>,
 }
 
 type PtyState = Arc<Mutex<PtyManager>>;
+
+/// SFTP 세션은 별도 뮤텍스로 분리한다.
+/// 파일 전송이 락을 길게 잡아도 터미널 입력(PtyManager)은 막히지 않게 하기 위함.
+type SftpState = Arc<Mutex<HashMap<u32, SftpHandle>>>;
 
 /// SSH 연결 설정 (프론트에서 받음)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +63,7 @@ struct SshConfig {
 
 /// 로컬 PTY 생성
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri 커맨드: 인자는 모두 프레임워크가 주입
 fn create_pty(
     id: u32,
     cols: u16,
@@ -67,11 +71,12 @@ fn create_pty(
     tab_type: String,
     ssh_config: Option<SshConfig>,
     state: State<'_, PtyState>,
+    sftp_state: State<'_, SftpState>,
     app: AppHandle,
 ) -> Result<u32, String> {
     if tab_type == "ssh" {
         if let Some(config) = ssh_config {
-            return create_ssh_pty(id, cols, rows, config, state, app);
+            return create_ssh_pty(id, cols, rows, config, state, sftp_state, app);
         }
         return Err("SSH config required".to_string());
     }
@@ -171,6 +176,7 @@ fn create_ssh_pty(
     rows: u16,
     config: SshConfig,
     state: State<'_, PtyState>,
+    sftp_state: State<'_, SftpState>,
     app: AppHandle,
 ) -> Result<u32, String> {
     // 0. 비밀번호 모드 첫 접속 처리.
@@ -186,7 +192,7 @@ fn create_ssh_pty(
     }
 
     // 1. SFTP용 SSH 세션을 먼저 동기적으로 생성 (인증은 키체인 비밀번호/키로 수행)
-    setup_sftp(id, &config, state.inner(), &app);
+    setup_sftp(id, &config, sftp_state.inner(), &app);
 
     // 2. SSH 입력 채널 생성
     let (input_tx, input_rx) = std::sync::mpsc::channel::<SshMsg>();
@@ -199,6 +205,7 @@ fn create_ssh_pty(
     // 3. SSH 터미널 연결 (별도 스레드). 끊기면 최대 3회 자동 재연결.
     let app_clone = app.clone();
     let state_clone = Arc::clone(state.inner());
+    let sftp_state_clone = Arc::clone(sftp_state.inner());
     thread::spawn(move || {
         let mut attempt = 0u32;
         loop {
@@ -239,13 +246,15 @@ fn create_ssh_pty(
             thread::sleep(std::time::Duration::from_secs(2 * attempt as u64));
 
             // SFTP 재생성 후 프론트에 재연결 알림 (TMOUT/OSC7 재주입 트리거)
-            setup_sftp(id, &config, &state_clone, &app_clone);
+            setup_sftp(id, &config, &sftp_state_clone, &app_clone);
             let _ = app_clone.emit("pty-reconnected", serde_json::json!({ "id": id }));
         }
 
         if let Ok(mut mgr) = state_clone.lock() {
             mgr.ssh_inputs.remove(&id);
-            mgr.sftps.remove(&id);
+        }
+        if let Ok(mut sftps) = sftp_state_clone.lock() {
+            sftps.remove(&id);
         }
     });
 
@@ -253,7 +262,7 @@ fn create_ssh_pty(
 }
 
 /// SFTP 세션을 만들어 상태에 등록한다. 실패해도 치명적이지 않음(파일트리만 비활성화).
-fn setup_sftp(id: u32, config: &SshConfig, state: &PtyState, app: &AppHandle) {
+fn setup_sftp(id: u32, config: &SshConfig, sftp_state: &SftpState, app: &AppHandle) {
     match create_sftp_session(config) {
         Ok(sftp_session) => {
             // 홈 디렉토리 가져오기
@@ -272,8 +281,8 @@ fn setup_sftp(id: u32, config: &SshConfig, state: &PtyState, app: &AppHandle) {
 
             sftp_session.set_blocking(false);
 
-            if let Ok(mut mgr) = state.lock() {
-                mgr.sftps.insert(id, SftpHandle {
+            if let Ok(mut sftps) = sftp_state.lock() {
+                sftps.insert(id, SftpHandle {
                     session: sftp_session,
                     cwd,
                 });
@@ -807,9 +816,9 @@ struct FileEntry {
 
 /// SFTP 디렉토리 목록
 #[tauri::command]
-fn sftp_list_dir(id: u32, path: Option<String>, state: State<'_, PtyState>) -> Result<Vec<FileEntry>, String> {
-    let mut mgr = state.lock().map_err(|e| e.to_string())?;
-    let sftp_handle = mgr.sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
+fn sftp_list_dir(id: u32, path: Option<String>, sftp_state: State<'_, SftpState>) -> Result<Vec<FileEntry>, String> {
+    let mut sftps = sftp_state.lock().map_err(|e| e.to_string())?;
+    let sftp_handle = sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
 
     sftp_handle.session.set_timeout(30_000);
     sftp_handle.session.set_blocking(true);
@@ -846,17 +855,17 @@ fn sftp_list_dir(id: u32, path: Option<String>, state: State<'_, PtyState>) -> R
 
 /// SFTP 현재 경로 (저장된 cwd 반환)
 #[tauri::command]
-fn sftp_get_cwd(id: u32, state: State<'_, PtyState>) -> Result<String, String> {
-    let mgr = state.lock().map_err(|e| e.to_string())?;
-    let sftp_handle = mgr.sftps.get(&id).ok_or("SFTP 연결 없음")?;
+fn sftp_get_cwd(id: u32, sftp_state: State<'_, SftpState>) -> Result<String, String> {
+    let sftps = sftp_state.lock().map_err(|e| e.to_string())?;
+    let sftp_handle = sftps.get(&id).ok_or("SFTP 연결 없음")?;
     Ok(sftp_handle.cwd.clone())
 }
 
 /// SSH 셸의 실제 pwd 실행 (새로고침 버튼 전용)
 #[tauri::command]
-fn sftp_sync_cwd(id: u32, state: State<'_, PtyState>) -> Result<String, String> {
-    let mut mgr = state.lock().map_err(|e| e.to_string())?;
-    let sftp_handle = mgr.sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
+fn sftp_sync_cwd(id: u32, sftp_state: State<'_, SftpState>) -> Result<String, String> {
+    let mut sftps = sftp_state.lock().map_err(|e| e.to_string())?;
+    let sftp_handle = sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
 
     sftp_handle.session.set_timeout(30_000);
     sftp_handle.session.set_blocking(true);
@@ -882,11 +891,11 @@ fn sftp_sync_cwd(id: u32, state: State<'_, PtyState>) -> Result<String, String> 
 
 /// SFTP 파일 다운로드 (별도 스레드 + 이벤트 기반 진행률)
 #[tauri::command]
-fn sftp_download(id: u32, remote_path: String, local_path: String, state: State<'_, PtyState>, app: AppHandle) -> Result<(), String> {
+fn sftp_download(id: u32, remote_path: String, local_path: String, sftp_state: State<'_, SftpState>, app: AppHandle) -> Result<(), String> {
     // 연결 존재 여부만 빠르게 확인
     {
-        let mgr = state.lock().map_err(|e| e.to_string())?;
-        if !mgr.sftps.contains_key(&id) {
+        let sftps = sftp_state.lock().map_err(|e| e.to_string())?;
+        if !sftps.contains_key(&id) {
             return Err("SFTP 연결 없음".to_string());
         }
     }
@@ -895,13 +904,13 @@ fn sftp_download(id: u32, remote_path: String, local_path: String, state: State<
         .file_name().map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| remote_path.clone());
 
-    let state_clone = state.inner().clone();
+    let sftp_state_clone = sftp_state.inner().clone();
     let app_clone = app.clone();
 
     thread::spawn(move || {
         let result = (|| -> Result<(), String> {
-            let mut mgr = state_clone.lock().map_err(|e| e.to_string())?;
-            let sftp_handle = mgr.sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
+            let mut sftps = sftp_state_clone.lock().map_err(|e| e.to_string())?;
+            let sftp_handle = sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
 
             sftp_handle.session.set_timeout(60_000);
             sftp_handle.session.set_blocking(true);
@@ -964,11 +973,11 @@ fn sftp_download(id: u32, remote_path: String, local_path: String, state: State<
 
 /// SFTP 파일 업로드 (별도 스레드 + 이벤트 기반 진행률)
 #[tauri::command]
-fn sftp_upload(id: u32, local_path: String, remote_path: String, state: State<'_, PtyState>, app: AppHandle) -> Result<(), String> {
+fn sftp_upload(id: u32, local_path: String, remote_path: String, sftp_state: State<'_, SftpState>, app: AppHandle) -> Result<(), String> {
     // 연결 존재 여부만 빠르게 확인
     {
-        let mgr = state.lock().map_err(|e| e.to_string())?;
-        if !mgr.sftps.contains_key(&id) {
+        let sftps = sftp_state.lock().map_err(|e| e.to_string())?;
+        if !sftps.contains_key(&id) {
             return Err("SFTP 연결 없음".to_string());
         }
     }
@@ -977,7 +986,7 @@ fn sftp_upload(id: u32, local_path: String, remote_path: String, state: State<'_
         .file_name().map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| local_path.clone());
 
-    let state_clone = state.inner().clone();
+    let sftp_state_clone = sftp_state.inner().clone();
     let app_clone = app.clone();
 
     thread::spawn(move || {
@@ -986,8 +995,8 @@ fn sftp_upload(id: u32, local_path: String, remote_path: String, state: State<'_
             let contents = std::fs::read(&local_path).map_err(|e| e.to_string())?;
             let total_size = contents.len() as u64;
 
-            let mut mgr = state_clone.lock().map_err(|e| e.to_string())?;
-            let sftp_handle = mgr.sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
+            let mut sftps = sftp_state_clone.lock().map_err(|e| e.to_string())?;
+            let sftp_handle = sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
 
             sftp_handle.session.set_timeout(60_000);
             sftp_handle.session.set_blocking(true);
@@ -1122,9 +1131,9 @@ fn get_ssh_connections() -> Vec<SshConfig> {
 
 /// SFTP 파일 삭제
 #[tauri::command]
-fn sftp_delete(id: u32, remote_path: String, is_dir: bool, state: State<'_, PtyState>) -> Result<(), String> {
-    let mut mgr = state.lock().map_err(|e| e.to_string())?;
-    let sftp_handle = mgr.sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
+fn sftp_delete(id: u32, remote_path: String, is_dir: bool, sftp_state: State<'_, SftpState>) -> Result<(), String> {
+    let mut sftps = sftp_state.lock().map_err(|e| e.to_string())?;
+    let sftp_handle = sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
     sftp_handle.session.set_timeout(30_000);
     sftp_handle.session.set_blocking(true);
     let result = (|| -> Result<(), String> {
@@ -1143,9 +1152,9 @@ fn sftp_delete(id: u32, remote_path: String, is_dir: bool, state: State<'_, PtyS
 
 /// SFTP 이름 변경
 #[tauri::command]
-fn sftp_rename(id: u32, old_path: String, new_path: String, state: State<'_, PtyState>) -> Result<(), String> {
-    let mut mgr = state.lock().map_err(|e| e.to_string())?;
-    let sftp_handle = mgr.sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
+fn sftp_rename(id: u32, old_path: String, new_path: String, sftp_state: State<'_, SftpState>) -> Result<(), String> {
+    let mut sftps = sftp_state.lock().map_err(|e| e.to_string())?;
+    let sftp_handle = sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
     sftp_handle.session.set_timeout(30_000);
     sftp_handle.session.set_blocking(true);
     let result = (|| -> Result<(), String> {
@@ -1291,8 +1300,8 @@ pub fn run() {
         .manage(Arc::new(Mutex::new(PtyManager {
             ptys: HashMap::new(),
             ssh_inputs: HashMap::new(),
-            sftps: HashMap::new(),
         })))
+        .manage(Arc::new(Mutex::new(HashMap::<u32, SftpHandle>::new())))
         .plugin(tauri_plugin_log::Builder::default().level(log::LevelFilter::Info).build())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![

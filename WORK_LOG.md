@@ -109,3 +109,23 @@
 - 검증: cargo clippy 경고 0, cargo test 8 passed, esbuild 번들 성공, cargo tauri build --debug 성공 후 실행. 실서버 동작(재연결·지문검증)은 수동 확인 필요
 
 ---
+
+## 2026-06-28 00:00 ~ 00:17 (약 17분)
+
+### 요청
+- 그동안 작업을 커밋 단위로 정리
+- SFTP 파일 업로드 중 SSH 터미널이 멈추는 현상 분석·개선·테스트
+
+### 처리 결과
+- 커밋 정리(2건): decf1e2 chore(health), 0fa02f1 feat(ssh/sftp). 깨끗한 트리에서 health만 재적용→커밋1, 최종본 복원→커밋2. 각 커밋 독립적으로 cargo clippy 0 + test 8 통과 확인. push 안 함
+
+- SFTP 업로드 중 터미널 멈춤: 근본 원인 = 전역 Mutex(PtyManager) 경합. sftp_upload/download가 파일 전송 내내 PtyManager 락을 점유했고, pty_write(키 입력)도 같은 락을 써서 업로드 동안 키 입력이 블록됨
+- 해결: SftpHandle 맵을 PtyManager에서 떼어내 별도 뮤텍스 `SftpState`로 분리
+  - PtyManager는 ptys/ssh_inputs만 보유, sftps는 `Arc<Mutex<HashMap<u32, SftpHandle>>>`로 분리
+  - 7개 sftp_* 커맨드 + setup_sftp + create_pty/create_ssh_pty + run() manage 수정 (총 13곳)
+  - create_pty는 인자 8개가 되어 clippy too_many_arguments 발생 → Tauri 주입 인자라 #[allow] 처리
+- 효과: pty_write→PtyState, sftp_upload→SftpState로 뮤텍스 분리 → 업로드가 키 입력을 막지 못함 (정적 grep으로 공유 없음 확인)
+- 한계: SFTP 작업끼리는 SftpState로 직렬화(동일 세션 동시사용 방지, 안전). 업로드 중 파일트리 갱신은 대기하지만 터미널은 반응함
+- 검증: cargo clippy 0, cargo test 8 passed, tauri build 성공, 앱 정상 부팅(두 State 등록 OK). 실제 업로드 멈춤 해소는 실서버 필요 — 코드/빌드/부팅 레벨까지 확인
+
+---
