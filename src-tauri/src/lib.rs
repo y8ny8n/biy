@@ -21,6 +21,14 @@ enum SshMsg {
 }
 type SshInputSender = std::sync::mpsc::Sender<SshMsg>;
 
+/// SSH 셸 루프 종료 사유. 재연결 판단에 사용.
+enum SshOutcome {
+    /// 사용자가 정상 종료 (재연결하지 않음)
+    Closed,
+    /// 네트워크 끊김 등 비정상 종료 (재연결 시도)
+    Disconnected(String),
+}
+
 /// SFTP 핸들 (SSH 연결과 연동)
 struct SftpHandle {
     session: ssh2::Session,
@@ -165,9 +173,88 @@ fn create_ssh_pty(
     state: State<'_, PtyState>,
     app: AppHandle,
 ) -> Result<u32, String> {
-    // 1. SFTP용 SSH 세션을 먼저 동기적으로 생성 (인증 포함)
-    //    이 과정에서 비밀번호가 키체인에 저장됨
-    match create_sftp_session(&config) {
+    // 0. 비밀번호 모드 첫 접속 처리.
+    //    create_sftp_session은 비밀번호를 묻지 않고 키체인만 확인하므로,
+    //    키체인이 비어 있으면 SFTP가 먼저 인증에 실패해 첫 접속에 파일트리가 뜨지 않는다.
+    //    여기서 비밀번호를 한 번만 받아 키체인에 저장하면 SFTP·SSH 셸 둘 다 그것을 재사용한다.
+    if config.auth_type.eq_ignore_ascii_case("password")
+        && keychain_get_password(&config.host, &config.username).is_none()
+    {
+        if let Some(pw) = prompt_password(&config.host, &config.username) {
+            keychain_save_password(&config.host, &config.username, &pw);
+        }
+    }
+
+    // 1. SFTP용 SSH 세션을 먼저 동기적으로 생성 (인증은 키체인 비밀번호/키로 수행)
+    setup_sftp(id, &config, state.inner(), &app);
+
+    // 2. SSH 입력 채널 생성
+    let (input_tx, input_rx) = std::sync::mpsc::channel::<SshMsg>();
+    {
+        if let Ok(mut mgr) = state.lock() {
+            mgr.ssh_inputs.insert(id, input_tx);
+        }
+    }
+
+    // 3. SSH 터미널 연결 (별도 스레드). 끊기면 최대 3회 자동 재연결.
+    let app_clone = app.clone();
+    let state_clone = Arc::clone(state.inner());
+    thread::spawn(move || {
+        let mut attempt = 0u32;
+        loop {
+            let started = std::time::Instant::now();
+            let outcome = ssh_session(&config, cols, rows, id, &app_clone, &input_rx);
+
+            // 30초 이상 유지됐다면 안정적 연결로 보고 재시도 카운터 리셋
+            if started.elapsed() >= std::time::Duration::from_secs(30) {
+                attempt = 0;
+            }
+
+            let reason = match outcome {
+                Ok(SshOutcome::Closed) => {
+                    let _ = app_clone.emit("pty-exit", serde_json::json!({ "id": id }));
+                    break;
+                }
+                Ok(SshOutcome::Disconnected(r)) => r,
+                Err(e) => {
+                    log::error!("SSH error: {}", e);
+                    format!("{}", e)
+                }
+            };
+
+            attempt += 1;
+            if attempt > 3 {
+                let _ = app_clone.emit("pty-error", serde_json::json!({
+                    "id": id,
+                    "error": format!("{} — 재연결 실패", reason),
+                }));
+                let _ = app_clone.emit("pty-exit", serde_json::json!({ "id": id }));
+                break;
+            }
+
+            let _ = app_clone.emit("pty-error", serde_json::json!({
+                "id": id,
+                "error": format!("{} — 재연결 중 ({}/3)...", reason, attempt),
+            }));
+            thread::sleep(std::time::Duration::from_secs(2 * attempt as u64));
+
+            // SFTP 재생성 후 프론트에 재연결 알림 (TMOUT/OSC7 재주입 트리거)
+            setup_sftp(id, &config, &state_clone, &app_clone);
+            let _ = app_clone.emit("pty-reconnected", serde_json::json!({ "id": id }));
+        }
+
+        if let Ok(mut mgr) = state_clone.lock() {
+            mgr.ssh_inputs.remove(&id);
+            mgr.sftps.remove(&id);
+        }
+    });
+
+    Ok(id)
+}
+
+/// SFTP 세션을 만들어 상태에 등록한다. 실패해도 치명적이지 않음(파일트리만 비활성화).
+fn setup_sftp(id: u32, config: &SshConfig, state: &PtyState, app: &AppHandle) {
+    match create_sftp_session(config) {
         Ok(sftp_session) => {
             // 홈 디렉토리 가져오기
             sftp_session.set_timeout(30_000);
@@ -180,7 +267,8 @@ fn create_ssh_pty(
                 ch.wait_close().ok()?;
                 let p = out.trim().to_string();
                 if p.is_empty() { None } else { Some(p) }
-            })().unwrap_or_else(|| "/root".to_string());
+            })()
+            .unwrap_or_else(|| "/root".to_string());
 
             sftp_session.set_blocking(false);
 
@@ -200,38 +288,47 @@ fn create_ssh_pty(
             }));
         }
     }
+}
 
-    // 2. SSH 입력 채널 생성
-    let (input_tx, input_rx) = std::sync::mpsc::channel::<SshMsg>();
-    {
-        if let Ok(mut mgr) = state.lock() {
-            mgr.ssh_inputs.insert(id, input_tx);
-        }
+/// 서버 호스트 키 검증 (TOFU). 처음 보는 서버는 저장하고, 지문이 바뀌면 차단한다.
+/// 저장 위치: ~/.config/termy/known_hosts (시스템 ~/.ssh/known_hosts는 건드리지 않음).
+fn verify_host_key(
+    session: &ssh2::Session,
+    host: &str,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = dirs::home_dir()
+        .ok_or("홈 디렉토리를 찾을 수 없음")?
+        .join(".config/termy/known_hosts");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
 
-    // 3. SSH 터미널 연결 (별도 스레드)
-    let app_clone = app.clone();
-    let state_clone = Arc::clone(state.inner());
-    thread::spawn(move || {
-        match ssh_session(&config, cols, rows, id, &app_clone, input_rx) {
-            Ok(_) => {}
-            Err(e) => {
-                log::error!("SSH error: {}", e);
-                let error_msg = format!("{}", e);
-                let _ = app_clone.emit("pty-error", serde_json::json!({
-                    "id": id,
-                    "error": error_msg,
-                }));
-                let _ = app_clone.emit("pty-exit", serde_json::json!({ "id": id }));
-            }
-        }
-        if let Ok(mut mgr) = state_clone.lock() {
-            mgr.ssh_inputs.remove(&id);
-            mgr.sftps.remove(&id);
-        }
-    });
+    let mut known = session.known_hosts()?;
+    // 기존 파일 로드 (없으면 무시)
+    let _ = known.read_file(&path, ssh2::KnownHostFileKind::OpenSSH);
 
-    Ok(id)
+    let (key, key_type) = session
+        .host_key()
+        .ok_or("서버 호스트 키를 가져올 수 없음")?;
+
+    match known.check_port(host, port, key) {
+        ssh2::CheckResult::Match => Ok(()),
+        ssh2::CheckResult::NotFound => {
+            // TOFU: 처음 보는 서버 → 저장
+            known.add(host, key, "termy", key_type.into())?;
+            known.write_file(&path, ssh2::KnownHostFileKind::OpenSSH)?;
+            log::info!("새 호스트 키 저장: {}:{}", host, port);
+            Ok(())
+        }
+        ssh2::CheckResult::Mismatch => Err(format!(
+            "서버 지문이 바뀌었습니다 ({}:{}). 중간자 공격(MITM) 가능성이 있어 접속을 차단합니다. \
+             서버를 정말 교체한 게 맞다면 ~/.config/termy/known_hosts 의 해당 항목을 삭제하세요.",
+            host, port
+        )
+        .into()),
+        ssh2::CheckResult::Failure => Err("호스트 키 검증에 실패했습니다".into()),
+    }
 }
 
 /// SFTP용 SSH 세션 생성
@@ -253,6 +350,8 @@ fn create_sftp_session(config: &SshConfig) -> Result<ssh2::Session, Box<dyn std:
     session.handshake()?;
     session.set_keepalive(true, 30);
     session.set_timeout(30_000);
+
+    verify_host_key(&session, &config.host, config.port)?;
 
     // 인증 (ssh_session과 동일 로직)
     let mut authenticated = false;
@@ -313,8 +412,8 @@ fn ssh_session(
     rows: u16,
     id: u32,
     app: &AppHandle,
-    input_rx: std::sync::mpsc::Receiver<SshMsg>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    input_rx: &std::sync::mpsc::Receiver<SshMsg>,
+) -> Result<SshOutcome, Box<dyn std::error::Error>> {
     use std::net::TcpStream;
 
     let addr = format!("{}:{}", config.host, config.port);
@@ -338,6 +437,8 @@ fn ssh_session(
     })?;
     session.set_keepalive(true, 30);
     session.set_timeout(30_000);
+
+    verify_host_key(&session, &config.host, config.port)?;
 
     // 인증
     let mut authenticated = false;
@@ -440,6 +541,18 @@ fn ssh_session(
                                         let _ = app.emit("pty-title", serde_json::json!({
                                             "id": id, "title": &s[2..],
                                         }));
+                                    } else if let Some(rest) = s.strip_prefix("7;") {
+                                        // OSC 7: file://<host>/<path> → 경로만 추출해 트리에 전달
+                                        let body = rest.strip_prefix("file://").unwrap_or(rest);
+                                        let path = match body.find('/') {
+                                            Some(i) => &body[i..],
+                                            None => body,
+                                        };
+                                        if !path.is_empty() {
+                                            let _ = app.emit("pty-cwd", serde_json::json!({
+                                                "id": id, "cwd": path,
+                                            }));
+                                        }
                                     }
                                 }
                                 osc_state = 0;
@@ -502,14 +615,11 @@ fn ssh_session(
         thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    if let Some(reason) = disconnect_reason {
-        let _ = app.emit("pty-error", serde_json::json!({
-            "id": id,
-            "error": reason,
-        }));
+    // 종료 사유를 호출자(재연결 루프)에게 반환. 이벤트 emit은 루프가 담당.
+    match disconnect_reason {
+        Some(reason) => Ok(SshOutcome::Disconnected(reason)),
+        None => Ok(SshOutcome::Closed),
     }
-    let _ = app.emit("pty-exit", serde_json::json!({ "id": id }));
-    Ok(())
 }
 
 /// ~ 또는 $HOME 확장

@@ -233,11 +233,9 @@ async function createTab(type = 'local', sshConfig = null) {
   setTimeout(() => {
     term.focus();
     loadFilesForTab(id);
-    // SSH 접속 시 TMOUT=0 자동 설정 (자동 타임아웃 방지)
+    // SSH 접속 시 TMOUT=0 + cd 자동추적(OSC7) 설정 주입
     if (type === 'ssh') {
-      setTimeout(() => {
-        invoke('pty_write', { id, data: 'export TMOUT=0\r' });
-      }, 1000);
+      injectSshInit(id);
     }
     console.log('Terminal focused, tab:', id);
   }, 500);
@@ -899,6 +897,20 @@ function showToast(message, isError = false) {
   }, 3000);
 }
 
+// SSH 접속/재연결 시 원격 셸에 초기 설정 주입.
+// 1) 원격 echo를 잠깐 끄고 → 2) 긴 설정 줄을 화면에 안 보이게 주입 → 3) echo 복구.
+// TMOUT=0 + cd 시마다 OSC 7로 현재 경로 자동 출력(bash/zsh). BEL(\007) 종료라
+// 백엔드 OSC 파서가 그대로 잡는다. 짧은 'stty -echo' 한 줄만 화면에 남는다.
+function injectSshInit(id) {
+  setTimeout(() => {
+    invoke('pty_write', { id, data: '\x15stty -echo\r' });
+  }, 1000);
+  setTimeout(() => {
+    const setup = `export TMOUT=0; if [ -n "$ZSH_VERSION" ]; then autoload -Uz add-zsh-hook 2>/dev/null; __termy7(){ printf '\\033]7;file://%s\\007' "$PWD"; }; add-zsh-hook chpwd __termy7 2>/dev/null; __termy7; elif [ -n "$BASH_VERSION" ]; then __termy7(){ printf '\\033]7;file://%s\\007' "$PWD"; }; case "$PROMPT_COMMAND" in *__termy7*) ;; *) PROMPT_COMMAND="__termy7;$PROMPT_COMMAND";; esac; __termy7; fi; stty echo\r`;
+    invoke('pty_write', { id, data: setup });
+  }, 1200);
+}
+
 // SSH 터미널에서 pwd 실행 후 경로 반환
 function getPwdFromTerminal(tabId) {
   return new Promise(async (resolve) => {
@@ -1062,7 +1074,7 @@ listen('pty-title', (event) => {
     tab.title = title;
     renderTabBar();
 
-    // 활성 탭이면 파일 트리도 갱신 (로컬 탭만, SSH는 별도 관리)
+    // 활성 탭이면 파일 트리도 갱신 (로컬 탭만, SSH는 pty-cwd에서 처리)
     if (id === activeTabId && tab.type !== 'ssh') {
       const path = pathFromTitle(title);
       if (path) {
@@ -1071,6 +1083,28 @@ listen('pty-title', (event) => {
     }
   }
 }).then(() => console.log('Listening for pty-title'));
+
+// SSH 터미널 cd → SFTP 파일트리 자동 추적 (OSC 7 기반)
+listen('pty-cwd', (event) => {
+  const { id, cwd } = event.payload;
+  const tab = tabs.find(t => t.id === id);
+  // 활성 SSH 탭이고, 트리가 보고 있는 경로와 다를 때만 갱신 (엔터 연타 시 중복 요청 방지)
+  if (tab && tab.type === 'ssh' && id === activeTabId && fileTreeView.state.cwd !== cwd) {
+    fileTreeView.load(id, cwd);
+  }
+}).then(() => console.log('Listening for pty-cwd'));
+
+// SSH 자동 재연결 성공 → cd 추적 설정 재주입 + 파일트리 재로드
+listen('pty-reconnected', (event) => {
+  const { id } = event.payload;
+  const tab = tabs.find(t => t.id === id);
+  if (tab && tab.type === 'ssh') {
+    injectSshInit(id);
+    if (id === activeTabId) {
+      setTimeout(() => fileTreeView.load(id), 1500);
+    }
+  }
+}).then(() => console.log('Listening for pty-reconnected'));
 
 // ── 키보드 단축키 ──
 
