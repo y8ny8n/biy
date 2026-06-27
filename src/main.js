@@ -800,6 +800,7 @@ const fileTreeView = {
     files.forEach((file, idx) => {
       const el = document.createElement('div');
       el.className = 'file-tree-item';
+      if (file.is_dir) el.classList.add('is-dir');
       el.dataset.idx = idx;
 
       const icon = document.createElement('span');
@@ -897,18 +898,35 @@ function showToast(message, isError = false) {
   }, 3000);
 }
 
+// 잔상 숨김용 sentinel. 설정 주입 끝에 보이지 않는 OSC로 출력하고,
+// 프론트는 이걸 볼 때까지의 출력(에코된 긴 설정 명령)을 숨긴다. xterm은 OSC 1337을 무시.
+const TERMY_SENTINEL = '\x1b]1337;termy-ready\x07';
+
+function writeLatin1(term, str) {
+  const out = new Uint8Array(str.length);
+  for (let i = 0; i < str.length; i++) out[i] = str.charCodeAt(i) & 0xff;
+  term.write(out);
+}
+
 // SSH 접속/재연결 시 원격 셸에 초기 설정 주입.
-// 1) 원격 echo를 잠깐 끄고 → 2) 긴 설정 줄을 화면에 안 보이게 주입 → 3) echo 복구.
-// TMOUT=0 + cd 시마다 OSC 7로 현재 경로 자동 출력(bash/zsh). BEL(\007) 종료라
-// 백엔드 OSC 파서가 그대로 잡는다. 짧은 'stty -echo' 한 줄만 화면에 남는다.
+// TMOUT=0 + cd 시마다 OSC 7로 현재 경로 자동 출력(bash/zsh). BEL(\007) 종료라 백엔드
+// OSC 파서가 그대로 잡는다. 끝에 sentinel을 붙여, 에코된 긴 명령은 화면에서 숨긴다.
 function injectSshInit(id) {
   setTimeout(() => {
-    invoke('pty_write', { id, data: '\x15stty -echo\r' });
-  }, 1000);
-  setTimeout(() => {
-    const setup = `export TMOUT=0; if [ -n "$ZSH_VERSION" ]; then autoload -Uz add-zsh-hook 2>/dev/null; __termy7(){ printf '\\033]7;file://%s\\007' "$PWD"; }; add-zsh-hook chpwd __termy7 2>/dev/null; __termy7; elif [ -n "$BASH_VERSION" ]; then __termy7(){ printf '\\033]7;file://%s\\007' "$PWD"; }; case "$PROMPT_COMMAND" in *__termy7*) ;; *) PROMPT_COMMAND="__termy7;$PROMPT_COMMAND";; esac; __termy7; fi; stty echo\r`;
+    const tab = tabs.find(t => t.id === id);
+    if (tab) { tab._suppress = ''; tab._suppressing = true; }
+    const setup = `\x15export TMOUT=0; if [ -n "$ZSH_VERSION" ]; then autoload -Uz add-zsh-hook 2>/dev/null; __termy7(){ printf '\\033]7;file://%s\\007' "$PWD"; }; add-zsh-hook chpwd __termy7 2>/dev/null; __termy7; elif [ -n "$BASH_VERSION" ]; then __termy7(){ printf '\\033]7;file://%s\\007' "$PWD"; }; case "$PROMPT_COMMAND" in *__termy7*) ;; *) PROMPT_COMMAND="__termy7;$PROMPT_COMMAND";; esac; __termy7; fi; printf '\\033]1337;termy-ready\\007'\r`;
     invoke('pty_write', { id, data: setup });
-  }, 1200);
+    // 안전장치: 2.5초 안에 sentinel을 못 보면 버린 출력을 그대로 흘려보내 터미널 손실 방지
+    setTimeout(() => {
+      const t = tabs.find(x => x.id === id);
+      if (t && t._suppressing) {
+        t._suppressing = false;
+        if (t._suppress) writeLatin1(t.term, t._suppress);
+        t._suppress = '';
+      }
+    }, 2500);
+  }, 1000);
 }
 
 // SSH 터미널에서 pwd 실행 후 경로 반환
@@ -1042,9 +1060,24 @@ async function loadSshList() {
 listen('pty-output', (event) => {
   const { id, data } = event.payload;
   const tab = tabs.find(t => t.id === id);
-  if (tab) {
-    tab.term.write(new Uint8Array(data));
+  if (!tab) return;
+  const arr = new Uint8Array(data);
+  // 접속 직후 설정 명령 잔상 숨김: sentinel을 볼 때까지 버퍼링 후 그 뒤만 출력
+  if (tab._suppressing) {
+    let s = '';
+    for (let i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i]);
+    tab._suppress += s;
+    const idx = tab._suppress.indexOf(TERMY_SENTINEL);
+    if (idx !== -1) {
+      const rest = tab._suppress.slice(idx + TERMY_SENTINEL.length);
+      tab._suppressing = false;
+      tab._suppress = '';
+      // 숨긴 명령 대신 줄바꿈 하나만 넣어 다음 프롬프트를 깨끗한 줄에 표시
+      writeLatin1(tab.term, '\r\n' + rest);
+    }
+    return;
   }
+  tab.term.write(arr);
 }).then(() => console.log('Listening for pty-output'));
 
 listen('pty-error', (event) => {

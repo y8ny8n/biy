@@ -23,6 +23,7 @@
   --accent: #0078d4;
   --accent-hover: #1a8aeb;
   --tab-active-border: #0078d4;
+  --folder: #7fb0e6;
   --sidebar-width: 220px;
 }
 
@@ -373,6 +374,7 @@ body {
 .file-tree-container {
   border-top: 1px solid var(--border);
   margin-top: 4px;
+  position: relative;
 }
 
 .file-tree-path {
@@ -533,16 +535,15 @@ body {
 }
 
 .file-tree-cd {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: white;
+  background: none;
+  color: var(--text-secondary);
   font-size: 13px;
   font-weight: 600;
 }
 
 .file-tree-cd:hover {
-  background: var(--accent-hover);
-  border-color: var(--accent-hover);
+  background: var(--accent);
+  border-color: var(--accent);
   color: white;
 }
 
@@ -583,11 +584,17 @@ body {
 
 .file-tree-name {
   font-size: 12px;
-  color: var(--text-primary);
+  color: var(--text-secondary);
   flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 폴더는 색을 입혀 파일과 빠르게 구분 */
+.file-tree-item.is-dir .file-tree-name {
+  color: var(--folder);
+  font-weight: 500;
 }
 
 .file-tree-size {
@@ -1033,21 +1040,26 @@ body {
 }
 
 /* 드롭존 */
+/* 드래그 중일 때만 나타나는 오버레이 (평소엔 공간 차지 안 함) */
 .file-tree-dropzone {
-  margin: 8px;
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 8px;
   padding: 12px;
-  border: 2px dashed var(--border);
+  border: 2px dashed var(--accent);
   border-radius: 8px;
   text-align: center;
-  color: var(--text-dim);
+  color: var(--accent);
   font-size: 11px;
-  transition: all 0.15s;
+  background: rgba(0, 120, 212, 0.12);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s;
 }
 
 .file-tree-dropzone.active {
-  border-color: var(--accent);
-  background: rgba(0, 120, 212, 0.1);
-  color: var(--accent);
+  opacity: 1;
 }
 
 /* 토스트 알림 */

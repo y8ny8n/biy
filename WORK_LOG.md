@@ -129,3 +129,20 @@
 - 검증: cargo clippy 0, cargo test 8 passed, tauri build 성공, 앱 정상 부팅(두 State 등록 OK). 실제 업로드 멈춤 해소는 실서버 필요 — 코드/빌드/부팅 레벨까지 확인
 
 ---
+
+## 2026-06-28 00:35 ~ 00:53 (약 18분)
+
+### 요청
+- UI 다듬기 4건: stty -echo 잔상 숨김, 드롭존 드래그 시에만, 주소창 cd버튼 색위계, 폴더 색 구분
+- (+드래그로 SFTP 다운로드 요청 → 별도 검토)
+
+### 처리 결과
+- 변경 파일: `src/main.js`, `src/styles.css`
+- (1) stty -echo 잔상 숨김: injectSshInit을 단일 라인 주입으로 재설계 + 끝에 보이지 않는 sentinel(OSC 1337) 출력. pty-output 리스너가 sentinel 볼 때까지 출력을 버퍼링→숨김, 그 뒤만 표시(앞에 \r\n 하나). 2.5초 안전장치. 결과는 "엔터 한 번" 친 듯 깔끔
+- (2) 드롭존: position absolute 오버레이로 변경, opacity 0 기본 → .active일 때만 표시. 평소 공간 차지 안 함(파일 리스트 넓어짐)
+- (3) cd 버튼: background accent(파랑 채움) → 외곽선 보조색, hover 시에만 accent. 사이드바 색 위계 정리
+- (4) 폴더 색: :root에 --folder(#7fb0e6) 추가, 렌더 시 폴더 행에 is-dir 클래스. 파일명=text-secondary(디밍), 폴더명=--folder(블루)로 대비
+- 검증: esbuild 번들 성공, tauri build 성공, 앱 재실행 후 스크린샷으로 (2)(3)(4) 육안 확인. (1)은 다음 SSH 접속 시 확인 필요
+- 드래그 다운로드(앱→Finder): Tauri WKWebView가 드래그아웃(DownloadURL/파일프로미스) 미지원 → 네이티브 작업 필요, 별도 스코프로 보류
+
+---
