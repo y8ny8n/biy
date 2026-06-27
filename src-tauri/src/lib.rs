@@ -5,7 +5,7 @@ use std::thread;
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 
 /// PTY 핸들
 struct PtyHandle {
@@ -242,7 +242,7 @@ fn create_sftp_session(config: &SshConfig) -> Result<ssh2::Session, Box<dyn std:
     let socket_addr: std::net::SocketAddr = addr.parse()
         .or_else(|_| {
             use std::net::ToSocketAddrs;
-            addr.to_socket_addrs()?.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "DNS 실패"))
+            addr.to_socket_addrs()?.next().ok_or_else(|| std::io::Error::other("DNS 실패"))
         })?;
     let tcp = TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_secs(10))?;
     tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
@@ -296,9 +296,7 @@ fn create_sftp_session(config: &SshConfig) -> Result<ssh2::Session, Box<dyn std:
 
     if !authenticated && !config.auth_type.eq_ignore_ascii_case("key") {
         if let Some(password) = keychain_get_password(&config.host, &config.username) {
-            if session.userauth_password(&config.username, &password).is_ok() {
-                authenticated = true;
-            }
+            let _ = session.userauth_password(&config.username, &password);
         }
     }
 
@@ -323,7 +321,7 @@ fn ssh_session(
     let socket_addr: std::net::SocketAddr = addr.parse()
         .or_else(|_| {
             use std::net::ToSocketAddrs;
-            addr.to_socket_addrs()?.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "DNS 실패"))
+            addr.to_socket_addrs()?.next().ok_or_else(|| std::io::Error::other("DNS 실패"))
         })
         .map_err(|e| -> Box<dyn std::error::Error> {
             format!("호스트를 찾을 수 없음: {} ({})", addr, e).into()
@@ -517,16 +515,21 @@ fn ssh_session(
 /// ~ 또는 $HOME 확장
 fn expand_path(p: &str) -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
+    expand_path_with_home(p, &home)
+}
+
+/// `~`, `~/`, `$HOME` 확장. 환경변수 의존을 분리해 단위 테스트가 가능하도록 home을 인자로 받음.
+fn expand_path_with_home(p: &str, home: &str) -> std::path::PathBuf {
     let trimmed = p.trim();
     if trimmed.is_empty() {
         return std::path::PathBuf::new();
     }
     let expanded = if trimmed == "~" {
-        home.clone()
+        home.to_string()
     } else if let Some(rest) = trimmed.strip_prefix("~/") {
         format!("{}/{}", home, rest)
     } else if trimmed.contains("$HOME") {
-        trimmed.replace("$HOME", &home)
+        trimmed.replace("$HOME", home)
     } else {
         trimmed.to_string()
     };
@@ -1208,4 +1211,73 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    const HOME: &str = "/Users/tester";
+
+    #[test]
+    fn expand_empty_and_blank() {
+        assert_eq!(expand_path_with_home("", HOME), PathBuf::new());
+        assert_eq!(expand_path_with_home("   ", HOME), PathBuf::new());
+    }
+
+    #[test]
+    fn expand_tilde_alone() {
+        assert_eq!(expand_path_with_home("~", HOME), PathBuf::from(HOME));
+    }
+
+    #[test]
+    fn expand_tilde_slash() {
+        assert_eq!(
+            expand_path_with_home("~/.ssh/id_rsa", HOME),
+            PathBuf::from("/Users/tester/.ssh/id_rsa")
+        );
+    }
+
+    #[test]
+    fn expand_home_var() {
+        assert_eq!(
+            expand_path_with_home("$HOME/keys/server.pem", HOME),
+            PathBuf::from("/Users/tester/keys/server.pem")
+        );
+        assert_eq!(expand_path_with_home("$HOME", HOME), PathBuf::from(HOME));
+    }
+
+    #[test]
+    fn expand_absolute_unchanged() {
+        assert_eq!(
+            expand_path_with_home("/etc/ssh/key", HOME),
+            PathBuf::from("/etc/ssh/key")
+        );
+    }
+
+    #[test]
+    fn expand_relative_unchanged() {
+        assert_eq!(
+            expand_path_with_home("keys/server.pem", HOME),
+            PathBuf::from("keys/server.pem")
+        );
+    }
+
+    #[test]
+    fn expand_trims_surrounding_whitespace() {
+        assert_eq!(
+            expand_path_with_home("  ~/key.pem  ", HOME),
+            PathBuf::from("/Users/tester/key.pem")
+        );
+    }
+
+    #[test]
+    fn expand_tilde_user_not_expanded() {
+        // `~other` 형식은 홈 확장 대상이 아니라 그대로 둔다.
+        assert_eq!(
+            expand_path_with_home("~other/key", HOME),
+            PathBuf::from("~other/key")
+        );
+    }
 }
