@@ -1167,6 +1167,131 @@ fn sftp_rename(id: u32, old_path: String, new_path: String, sftp_state: State<'_
     result
 }
 
+/// 원격 파일 → 로컬 경로로 읽기 (SftpState 락을 짧게 점유)
+fn sftp_read_to_local(
+    id: u32,
+    remote_path: &str,
+    local_path: &std::path::Path,
+    sftp_state: &SftpState,
+) -> Result<(), String> {
+    let mut sftps = sftp_state.lock().map_err(|e| e.to_string())?;
+    let h = sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
+    h.session.set_timeout(60_000);
+    h.session.set_blocking(true);
+    let r = (|| -> Result<(), String> {
+        let sftp = h.session.sftp().map_err(|e| e.to_string())?;
+        let mut rf = sftp
+            .open(std::path::Path::new(remote_path))
+            .map_err(|e| format!("원격 파일 열기 실패: {}", e))?;
+        let mut buf = Vec::new();
+        rf.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+        std::fs::write(local_path, &buf).map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    h.session.set_blocking(false);
+    r
+}
+
+/// 로컬 파일 → 원격 경로로 쓰기 (편집 자동 동기화용)
+fn sftp_write_from_local(
+    id: u32,
+    remote_path: &str,
+    local_path: &std::path::Path,
+    sftp_state: &SftpState,
+) -> Result<(), String> {
+    let contents = std::fs::read(local_path).map_err(|e| e.to_string())?;
+    let mut sftps = sftp_state.lock().map_err(|e| e.to_string())?;
+    let h = sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
+    h.session.set_timeout(60_000);
+    h.session.set_blocking(true);
+    let r = (|| -> Result<(), String> {
+        let sftp = h.session.sftp().map_err(|e| e.to_string())?;
+        let mut wf = sftp
+            .create(std::path::Path::new(remote_path))
+            .map_err(|e| format!("원격 파일 생성 실패: {}", e))?;
+        wf.write_all(&contents).map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    h.session.set_blocking(false);
+    r
+}
+
+/// 원격 파일을 로컬 에디터(Sublime Text)로 열고, 저장될 때마다 서버에 자동 업로드.
+/// 임시 파일을 감시하다 mtime이 바뀌면 업로드한다. SFTP 세션이 사라지면 감시 종료.
+#[tauri::command]
+fn sftp_edit(
+    id: u32,
+    remote_path: String,
+    sftp_state: State<'_, SftpState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let base = std::path::Path::new(&remote_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+
+    // 임시 위치: <tmp>/termy-edit/<tabId>/<파일명> (확장자 보존 → 문법 강조 유지)
+    let dir = std::env::temp_dir().join("termy-edit").join(id.to_string());
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let local = dir.join(&base);
+
+    // 1. 다운로드
+    sftp_read_to_local(id, &remote_path, &local, sftp_state.inner())?;
+
+    // 2. Sublime Text로 열기
+    let opened = std::process::Command::new("open")
+        .args(["-a", "Sublime Text", &local.to_string_lossy()])
+        .status();
+    match opened {
+        Ok(s) if s.success() => {}
+        _ => return Err("Sublime Text를 열 수 없습니다 (설치 여부 확인)".to_string()),
+    }
+
+    // 3. 저장(mtime 변경) 감시 → 자동 업로드
+    let sftp_state_clone = Arc::clone(sftp_state.inner());
+    let app_clone = app.clone();
+    let local_w = local.clone();
+    let remote_w = remote_path.clone();
+    let base_w = base.clone();
+    thread::spawn(move || {
+        let mut last = std::fs::metadata(&local_w)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        loop {
+            thread::sleep(std::time::Duration::from_secs(1));
+            // 탭/접속이 사라지면 감시 종료
+            let alive = sftp_state_clone
+                .lock()
+                .map(|m| m.contains_key(&id))
+                .unwrap_or(false);
+            if !alive {
+                break;
+            }
+            let cur = std::fs::metadata(&local_w)
+                .ok()
+                .and_then(|m| m.modified().ok());
+            if cur.is_some() && cur != last {
+                last = cur;
+                match sftp_write_from_local(id, &remote_w, &local_w, &sftp_state_clone) {
+                    Ok(_) => {
+                        let _ = app_clone
+                            .emit("edit-synced", serde_json::json!({ "name": base_w }));
+                    }
+                    Err(e) => {
+                        let _ = app_clone.emit(
+                            "edit-error",
+                            serde_json::json!({ "name": base_w, "error": e }),
+                        );
+                    }
+                }
+            }
+        }
+        log::info!("편집 감시 종료: {}", base_w);
+    });
+
+    Ok(())
+}
+
 /// 로컬 파일 삭제
 #[tauri::command]
 fn local_delete(path: String, is_dir: bool) -> Result<(), String> {
@@ -1324,6 +1449,7 @@ pub fn run() {
             sftp_sync_cwd,
             sftp_download,
             sftp_upload,
+            sftp_edit,
             local_list_dir,
             home_dir,
             get_pty_cwd,

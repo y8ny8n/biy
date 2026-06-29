@@ -164,3 +164,18 @@
 - 검증: esbuild 번들 + tauri build 성공, 앱 정상 실행. 실제 su 추적은 실서버 필요 — 코드/빌드 레벨 확인
 
 ---
+
+## 2026-06-28 01:20 ~ (원격 파일 Sublime 편집)
+
+### 요청
+- vi 대신 원격 텍스트 파일을 Sublime Text로 열어 수정→저장 시 서버 자동 반영
+
+### 처리 결과
+- 변경 파일: `src-tauri/src/lib.rs`, `src/main.js`, `src/index.html`
+- 백엔드 sftp_edit 커맨드: 원격 파일을 <tmp>/termy-edit/<tabId>/<파일명>으로 다운로드 → `open -a "Sublime Text"`로 열기 → 별도 스레드가 임시파일 mtime을 1초 폴링, 변경 시 서버 업로드(edit-synced/edit-error 이벤트). SFTP 세션 사라지면 감시 종료
+- 헬퍼 sftp_read_to_local / sftp_write_from_local 추가(SftpState 락 짧게 점유)
+- 프론트: 우클릭 메뉴에 "Sublime으로 편집"(원격 파일만 노출) + 핸들러 + edit-synced/error 토스트
+- 검증: cargo clippy 0, cargo test 8, esbuild 번들 성공, 정식 빌드 후 /Applications 갱신·실행. Sublime Text 설치 확인. 실제 편집-저장-반영은 실서버 필요
+- /Applications 단일 설치 유지, target/bundle 정리
+
+---

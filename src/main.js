@@ -1350,6 +1350,14 @@ listen('transfer-error', (event) => {
   }
 });
 
+// 원격 편집 자동 저장 동기화 알림
+listen('edit-synced', (event) => {
+  showToast(`서버에 저장됨: ${event.payload.name}`);
+});
+listen('edit-error', (event) => {
+  showToast(`저장 실패: ${event.payload.name} (${event.payload.error})`, true);
+});
+
 // ── 사이드바 탭 전환 ──
 
 document.querySelectorAll('.sidebar-tab').forEach(tab => {
@@ -2169,6 +2177,10 @@ function showContextMenu(e, target) {
   // 폴더면 다운로드 숨기기
   const dlBtn = menu.querySelector('[data-action="download"]');
   dlBtn.style.display = target.isDir ? 'none' : 'block';
+
+  // Sublime 편집은 원격(SSH) 파일에만 노출
+  const editBtn = menu.querySelector('[data-action="edit-sublime"]');
+  if (editBtn) editBtn.style.display = (target.type === 'ssh' && !target.isDir) ? 'block' : 'none';
 }
 
 function hideContextMenu() {
@@ -2188,6 +2200,15 @@ document.querySelectorAll('.context-item').forEach(item => {
     hideContextMenu();
 
     switch (item.dataset.action) {
+      case 'edit-sublime':
+        try {
+          await invoke('sftp_edit', { id: tabId, remotePath: path });
+          showToast(`Sublime으로 편집: ${name} (저장하면 서버에 자동 반영)`);
+        } catch (e) {
+          showToast(`편집 열기 실패: ${e}`, true);
+        }
+        break;
+
       case 'download':
         downloadFile(tabId, path, name);
         break;
