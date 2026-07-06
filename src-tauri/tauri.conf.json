@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "npx esbuild src/main.js --bundle --outfile=dist/main.js --format=esm --platform=browser && cp src/styles.css dist/ && cp src/index.html dist/",
-    "beforeBuildCommand": "npx esbuild src/main.js --bundle --outfile=dist/main.js --format=esm --platform=browser && cp src/styles.css dist/ && cp src/index.html dist/"
+    "beforeDevCommand": "npx esbuild src/main.js --bundle --outfile=dist/main.js --format=esm --platform=browser && cp src/styles.css dist/ && cp src/index.html dist/ && cp node_modules/@xterm/xterm/css/xterm.css dist/",
+    "beforeBuildCommand": "npx esbuild src/main.js --bundle --outfile=dist/main.js --format=esm --platform=browser && cp src/styles.css dist/ && cp src/index.html dist/ && cp node_modules/@xterm/xterm/css/xterm.css dist/"
   },
   "app": {
     "withGlobalTauri": true,

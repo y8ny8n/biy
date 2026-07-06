@@ -53,32 +53,37 @@ AI-integrated terminal emulator for macOS.
 | ⌘[ / ⌘] | Switch tabs |
 | ⌘⌥← / → | Switch split panes |
 
-## Build
+## 소스에서 직접 빌드 (Build from source)
 
-### Prerequisites
-- Rust (latest stable)
-- Node.js 18+
-- Tauri CLI (`cargo install tauri-cli`)
+내려받은 앱이 Gatekeeper("손상됨"/"확인되지 않은 개발자")로 안 열릴 때는, **직접 빌드하면 그런 경고 없이 바로 실행**됩니다 (로컬 빌드 앱은 격리가 안 붙음).
 
-### Development
+### 사전 준비 (Prerequisites)
+- **Rust** (stable) — https://rustup.rs 에서 한 줄 설치
+  ```bash
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  ```
+- **Node.js 18+** — https://nodejs.org (또는 `brew install node`)
+- macOS (Apple Silicon 권장)
+
+### 빌드 (Build)
 ```bash
-# Install dependencies
+git clone https://github.com/y8ny8n/biy.git
+cd biy
 npm install
-
-# Build frontend
-npx esbuild src/main.js --bundle --outfile=dist/main.js --format=esm --platform=browser
-cp src/styles.css dist/
-cp src/index.html dist/
-cp node_modules/@xterm/xterm/css/xterm.css dist/
-
-# Build app
-cargo tauri build --debug
+npm run build
 ```
-
-### Run
+빌드가 끝나면 앱 실행:
 ```bash
-open src-tauri/target/debug/bundle/macos/termy.app
+open src-tauri/target/release/bundle/macos/termy.app
 ```
+→ 마음에 들면 `termy.app`을 응용 프로그램(Applications) 폴더로 드래그하면 됩니다.
+
+### 개발 모드 (Dev, 실시간 리로드)
+```bash
+npm run dev
+```
+
+> 처음 빌드는 Rust 의존성 컴파일로 몇 분 걸립니다. 이후 빌드는 훨씬 빠릅니다.
 
 ## License
 
