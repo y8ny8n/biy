@@ -534,6 +534,21 @@ body {
   color: white;
 }
 
+.file-tree-elev {
+  font-size: 11px;
+  filter: grayscale(1) opacity(0.6);
+}
+
+.file-tree-elev:hover {
+  filter: none;
+}
+
+.file-tree-elev.active {
+  filter: none;
+  background: rgba(255, 159, 67, 0.18);
+  border-color: rgba(255, 159, 67, 0.6);
+}
+
 .file-tree-cd {
   background: none;
   color: var(--text-secondary);
@@ -629,6 +644,108 @@ body {
   background: var(--accent);
   border-color: var(--accent);
   color: white;
+}
+
+/* 정렬 버튼 (텍스트) */
+.file-tree-sort {
+  font-size: 10px;
+  font-weight: 600;
+  min-width: 34px;
+  padding: 0 4px;
+}
+
+.file-tree-filter-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+
+/* 필터 줄 */
+.file-tree-filter-row {
+  display: flex;
+}
+.file-tree-filter-row.hidden {
+  display: none;
+}
+.file-tree-filter-input {
+  width: 100%;
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 11px;
+  outline: none;
+}
+.file-tree-filter-input:focus {
+  border-color: var(--accent);
+}
+
+/* 파일 메타(날짜·크기) */
+.file-tree-meta {
+  font-size: 10px;
+  color: var(--text-dim);
+  font-family: 'SF Mono', 'Menlo', monospace;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* 권한 상승(root) 뱃지 + 모드 구분 */
+.file-tree-elev-badge {
+  display: block;
+  font-size: 10px;
+  font-weight: 700;
+  color: #ffb454;
+  background: rgba(255, 159, 67, 0.13);
+  border: 1px solid rgba(255, 159, 67, 0.4);
+  border-radius: 4px;
+  padding: 2px 6px;
+  margin-bottom: 2px;
+  text-align: center;
+  letter-spacing: 0.3px;
+}
+
+.file-tree-container.elevated .file-tree-path {
+  background: rgba(255, 159, 67, 0.06);
+  box-shadow: inset 2px 0 0 rgba(255, 159, 67, 0.55);
+}
+
+.file-tree-container.elevated .file-tree-cwd-input {
+  border-color: rgba(255, 159, 67, 0.4);
+}
+
+/* 하단 요약 바 */
+.file-tree-summary {
+  padding: 4px 12px;
+  font-size: 10px;
+  color: var(--text-dim);
+  border-top: 1px solid rgba(255,255,255,0.04);
+  background: rgba(255,255,255,0.015);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 로딩 */
+.file-tree-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 14px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.ft-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: ft-spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes ft-spin {
+  to { transform: rotate(360deg); }
 }
 
 /* 전송 상태 바 */
@@ -1063,25 +1180,74 @@ body {
 }
 
 /* 토스트 알림 */
-.toast {
+/* 단축키 도움말 */
+.shortcut-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 20px;
+}
+.shortcut-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--text-secondary);
+  padding: 2px 0;
+}
+.shortcut-row kbd {
+  font-family: -apple-system, 'SF Pro Text', sans-serif;
+  font-size: 11px;
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 2px 7px;
+  white-space: nowrap;
+}
+
+#toast-stack {
   position: fixed;
   bottom: 20px;
   right: 20px;
-  padding: 10px 18px;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.toast {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 16px;
   border-radius: 8px;
   font-size: 13px;
   color: white;
-  z-index: 9999;
   opacity: 0;
-  transform: translateY(10px);
-  transition: all 0.3s ease;
-  max-width: 300px;
-  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  transform: translateY(10px) scale(0.98);
+  transition: all 0.25s ease;
+  max-width: 320px;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.35);
 }
 
 .toast.show {
   opacity: 1;
-  transform: translateY(0);
+  transform: translateY(0) scale(1);
+}
+
+.toast-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.25);
+  font-size: 10px;
+  font-weight: 700;
+  flex-shrink: 0;
 }
 
 .toast-success {
@@ -1208,6 +1374,25 @@ body {
   opacity: 0.6;
 }
 
+/* 탭 접속 상태 점 */
+.tab-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--text-dim);
+}
+.tab-dot.on { background: #3fb950; }
+.tab-dot.off { background: #f85149; }
+.tab-dot.connecting {
+  background: #d29922;
+  animation: dot-pulse 1s ease-in-out infinite;
+}
+@keyframes dot-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
 /* 툴바 버튼 공통 */
 .toolbar-btn {
   background: none;
@@ -1326,6 +1511,12 @@ body {
   flex: 1;
   overflow: hidden;
   background: var(--bg-primary);
+}
+
+/* 분할 중 활성 창 하이라이트 */
+.split-focused {
+  box-shadow: inset 0 0 0 1.5px var(--accent);
+  border-radius: 2px;
 }
 
 /* xterm 커스텀 */

@@ -193,6 +193,62 @@
     </div>
   </div>
 
+  <!-- 파일트리 권한 상승 모달 -->
+  <div id="elev-modal" class="modal-overlay hidden">
+    <div class="modal" style="width:380px">
+      <div class="modal-header">
+        <span>파일트리 권한 상승</span>
+        <button id="elev-modal-close" class="modal-close">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-field">
+          <label>방식</label>
+          <div class="modal-auth-tabs">
+            <button class="modal-auth-tab active" data-elev="su">su (root)</button>
+            <button class="modal-auth-tab" data-elev="sudo">sudo</button>
+          </div>
+        </div>
+        <div class="modal-field">
+          <label id="elev-pw-label">root 비밀번호</label>
+          <input id="elev-password" type="password" placeholder="비밀번호 입력">
+          <span class="modal-hint">비밀번호는 메모리에만 보관되며 저장되지 않습니다. 전용 root 채널로 파일트리만 상승합니다.</span>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <div style="flex:1"></div>
+        <button id="elev-modal-cancel" class="modal-btn">취소</button>
+        <button id="elev-modal-apply" class="modal-btn modal-btn-primary">적용</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 단축키 도움말 오버레이 (⌘/) -->
+  <div id="shortcuts-modal" class="modal-overlay hidden">
+    <div class="modal" style="width:440px">
+      <div class="modal-header">
+        <span>키보드 단축키</span>
+        <button id="shortcuts-close" class="modal-close">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="shortcut-grid">
+          <div class="shortcut-row"><span>새 탭</span><kbd>⌘T</kbd></div>
+          <div class="shortcut-row"><span>탭 닫기</span><kbd>⌘W</kbd></div>
+          <div class="shortcut-row"><span>탭 전환</span><kbd>⌘[ / ⌘]</kbd></div>
+          <div class="shortcut-row"><span>좌우 분할</span><kbd>⌘D</kbd></div>
+          <div class="shortcut-row"><span>상하 분할</span><kbd>⌘⇧D</kbd></div>
+          <div class="shortcut-row"><span>분할 창 전환</span><kbd>⌘⌥← / →</kbd></div>
+          <div class="shortcut-row"><span>SSH 접속</span><kbd>⌘⇧N</kbd></div>
+          <div class="shortcut-row"><span>사이드바</span><kbd>⌘B</kbd></div>
+          <div class="shortcut-row"><span>검색</span><kbd>⌘F</kbd></div>
+          <div class="shortcut-row"><span>설정</span><kbd>⌘,</kbd></div>
+          <div class="shortcut-row"><span>글꼴 크기</span><kbd>⌘+ / ⌘-</kbd></div>
+          <div class="shortcut-row"><span>글꼴 초기화</span><kbd>⌘0</kbd></div>
+          <div class="shortcut-row"><span>단축키 도움말</span><kbd>⌘/</kbd></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script type="module" src="main.js"></script>
 </body>
 </html>

@@ -181,6 +181,9 @@ async function createTab(type = 'local', sshConfig = null) {
     container,
     ptyId: null,
     alive: true,
+    _connecting: type === 'ssh', // SSH는 접속 중 상태로 시작 (탭 상태점)
+    _elevated: false,    // 파일트리 권한 상승(전용 root 채널) 여부
+    _elevUser: null,     // 상승된 유저명 (표시용)
   };
 
   // Rust 백엔드에 PTY/SSH 생성 요청
@@ -194,6 +197,8 @@ async function createTab(type = 'local', sshConfig = null) {
       sshConfig: sshConfig || null,
     });
     tab.ptyId = ptyId;
+    tab._connecting = false;
+    renderTabBar();
     console.log('PTY created:', ptyId);
   } catch (e) {
     console.error('PTY creation failed:', e);
@@ -215,8 +220,15 @@ async function createTab(type = 'local', sshConfig = null) {
     });
   });
 
-  // 터미널 클릭 시 포커스
-  container.addEventListener('click', () => term.focus());
+  // 터미널 클릭 시 포커스 (분할 중이면 그 창을 활성화 + 하이라이트)
+  container.addEventListener('click', () => {
+    term.focus();
+    if (splitState && activeTabId !== tab.id) {
+      activeTabId = tab.id;
+      renderTabBar();
+    }
+    updateSplitFocus();
+  });
 
   // 리사이즈 → Rust
   term.onResize(({ cols, rows }) => {
@@ -316,7 +328,15 @@ function renderTabBar() {
     el.className = `tab ${tab.id === activeTabId ? 'active' : ''}`;
 
     const icon = tab.type === 'ssh' ? '🌐' : '⌘';
+    // 접속 상태 점 (SSH 전용): 초록=연결, 노랑(점멸)=접속중, 빨강=끊김
+    let dot = '';
+    if (tab.type === 'ssh') {
+      const st = !tab.alive ? 'off' : (tab._connecting ? 'connecting' : 'on');
+      const stText = st === 'on' ? '연결됨' : st === 'connecting' ? '접속 중' : '끊김';
+      dot = `<span class="tab-dot ${st}" title="${stText}"></span>`;
+    }
     el.innerHTML = `
+      ${dot}
       <span class="tab-icon">${icon}</span>
       <span class="tab-title">${escapeHtml(tab.title)}</span>
       <button class="tab-close" title="닫기">×</button>
@@ -383,7 +403,7 @@ function pathFromTitle(title) {
 
 const fileTreeView = {
   els: null,
-  state: { tabId: null, type: 'local', cwd: '', files: [], editing: false },
+  state: { tabId: null, type: 'local', cwd: '', files: [], editing: false, sortIdx: 0, filter: '' },
   _suggestItems: [],
   _suggestSelected: -1,
   _suggestTimer: null,
@@ -418,10 +438,25 @@ const fileTreeView = {
     hiddenBtn.title = '숨김 파일 표시';
     hiddenBtn.textContent = '.*';
 
-    actionsLeft.append(upBtn, hiddenBtn);
+    const sortBtn = document.createElement('button');
+    sortBtn.className = 'file-tree-btn file-tree-sort';
+    sortBtn.title = '정렬 방식 전환';
+    sortBtn.textContent = SORT_MODES[this.state.sortIdx].label;
+
+    const filterBtn = document.createElement('button');
+    filterBtn.className = 'file-tree-btn file-tree-filter-btn';
+    filterBtn.title = '이름 필터';
+    filterBtn.textContent = '🔍';
+
+    actionsLeft.append(upBtn, hiddenBtn, sortBtn, filterBtn);
 
     const actionsRight = document.createElement('div');
     actionsRight.className = 'file-tree-actions-right';
+
+    const elevBtn = document.createElement('button');
+    elevBtn.className = 'file-tree-btn file-tree-elev';
+    elevBtn.title = '권한 상승 (su/sudo)';
+    elevBtn.textContent = '🛡';
 
     const refreshBtn = document.createElement('button');
     refreshBtn.className = 'file-tree-btn file-tree-refresh';
@@ -433,7 +468,7 @@ const fileTreeView = {
     cdBtn.title = '터미널에서 이 경로로 이동';
     cdBtn.textContent = '▸';
 
-    actionsRight.append(refreshBtn, cdBtn);
+    actionsRight.append(elevBtn, refreshBtn, cdBtn);
     actions.append(actionsLeft, actionsRight);
 
     // 주소창 줄
@@ -452,25 +487,69 @@ const fileTreeView = {
 
     cwdWrap.append(cwdInput, suggest);
 
-    pathBar.append(actions, cwdWrap);
+    // 필터 줄 (🔍 토글로 표시)
+    const filterInput = document.createElement('input');
+    filterInput.className = 'file-tree-filter-input';
+    filterInput.type = 'text';
+    filterInput.spellcheck = false;
+    filterInput.placeholder = '이름으로 필터…';
+    const filterRow = document.createElement('div');
+    filterRow.className = 'file-tree-filter-row hidden';
+    filterRow.appendChild(filterInput);
+
+    pathBar.append(actions, cwdWrap, filterRow);
 
     const list = document.createElement('div');
     list.className = 'file-tree-list';
+
+    const summary = document.createElement('div');
+    summary.className = 'file-tree-summary';
 
     const dropZone = document.createElement('div');
     dropZone.className = 'file-tree-dropzone';
     dropZone.textContent = '파일을 여기에 드롭하여 업로드';
 
-    container.append(pathBar, list, dropZone);
+    container.append(pathBar, list, summary, dropZone);
     sessionList.appendChild(container);
 
-    this.els = { container, pathBar, upBtn, refreshBtn, hiddenBtn, cwdInput, cwdWrap, suggest, cdBtn, list, dropZone };
+    this.els = { container, pathBar, upBtn, refreshBtn, hiddenBtn, sortBtn, filterBtn, elevBtn, cwdInput, cwdWrap, suggest, cdBtn, list, summary, filterRow, filterInput, dropZone };
     this._bindEvents();
     return this.els;
   },
 
   _bindEvents() {
-    const { upBtn, refreshBtn, hiddenBtn, cwdInput, suggest, cdBtn, list, container } = this.els;
+    const { upBtn, refreshBtn, hiddenBtn, sortBtn, filterBtn, elevBtn, cwdInput, suggest, cdBtn, list, container, filterRow, filterInput } = this.els;
+
+    // 정렬 전환 (폴더는 항상 위)
+    sortBtn.addEventListener('click', () => {
+      this.state.sortIdx = (this.state.sortIdx + 1) % SORT_MODES.length;
+      sortBtn.textContent = SORT_MODES[this.state.sortIdx].label;
+      this._render();
+    });
+
+    // 필터 토글
+    filterBtn.addEventListener('click', () => {
+      const show = filterRow.classList.toggle('hidden') === false;
+      filterBtn.classList.toggle('active', show);
+      if (show) { filterInput.focus(); }
+      else { filterInput.value = ''; this.state.filter = ''; this._render(); }
+    });
+    filterInput.addEventListener('input', () => {
+      this.state.filter = filterInput.value.trim().toLowerCase();
+      this._render();
+    });
+    filterInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { filterBtn.click(); }
+    });
+
+    // 권한 상승 토글 (SSH 탭 전용): 켜면 root 비번창, 켜져 있으면 해제.
+    elevBtn.addEventListener('click', () => {
+      if (this.state.type !== 'ssh') return;
+      const tab = tabs.find(t => t.id === this.state.tabId);
+      if (!tab) return;
+      if (tab._elevated) dropElevation(tab);
+      else openElevationModal(tab.id, 'su');
+    });
 
     upBtn.addEventListener('click', () => {
       const cwd = this.state.cwd;
@@ -482,11 +561,10 @@ const fileTreeView = {
       const { tabId, type, cwd } = this.state;
       let realCwd = cwd;
       try {
-        if (type === 'ssh') {
-          realCwd = (await getPwdFromTerminal(tabId)) || cwd;
-        } else {
+        if (type === 'local') {
           realCwd = await invoke('get_pty_cwd', { id: tabId });
         }
+        // SSH는 OSC7로 cwd가 이미 동기화되어 있어 현재 경로를 그대로 다시 로드
       } catch {}
       this.load(tabId, realCwd);
     });
@@ -652,7 +730,36 @@ const fileTreeView = {
   _fileFromEvent(e) {
     const el = e.target.closest('.file-tree-item');
     if (!el) return null;
-    return this.state.files[Number(el.dataset.idx)] || null;
+    return (this._rendered || this.state.files)[Number(el.dataset.idx)] || null;
+  },
+
+
+  // 방패 버튼 상태를 현재 탭의 권한 상승 여부에 맞춘다 (로컬 탭에선 숨김).
+  _reflectElevation() {
+    if (!this.els) return;
+    const tab = tabs.find(t => t.id === this.state.tabId);
+    const on = !!(tab && tab._elevated);
+    const user = (tab && tab._elevUser) || 'root';
+    const { elevBtn, container } = this.els;
+    elevBtn.style.display = this.state.type === 'ssh' ? '' : 'none';
+    elevBtn.classList.toggle('active', on);
+    elevBtn.title = on
+      ? `권한 상승 ON (${user}) — 클릭시 해제`
+      : '권한 상승 (su/sudo로 root 파일 보기)';
+    // root 모드: 컨테이너에 클래스 + 헤더에 뱃지 (실수 방지용 시각 구분)
+    container.classList.toggle('elevated', on);
+    let badge = this.els.elevBadge;
+    if (on) {
+      if (!badge) {
+        badge = document.createElement('span');
+        badge.className = 'file-tree-elev-badge';
+        this.els.elevBadge = badge;
+      }
+      badge.textContent = `🛡 ${user}`;
+      if (!badge.isConnected) this.els.pathBar.insertBefore(badge, this.els.pathBar.firstChild);
+    } else if (badge && badge.isConnected) {
+      badge.remove();
+    }
   },
 
   async _expandPath(input) {
@@ -753,21 +860,32 @@ const fileTreeView = {
   async load(tabId, path) {
     if (!this.els) this._mount();
     if (!this.els) return;
+    // 로딩 표시 (SSH는 네트워크 지연이 있어 스피너를 잠깐 보여줌)
+    const loadTimer = setTimeout(() => {
+      if (this.els && this.state.tabId === tabId) {
+        this.els.list.innerHTML = '<div class="file-tree-loading"><span class="ft-spinner"></span>불러오는 중…</div>';
+      }
+    }, 150);
     try {
       const tab = tabs.find(t => t.id === tabId);
-      if (!tab) return;
+      if (!tab) { clearTimeout(loadTimer); return; }
       if (tab.type === 'ssh') {
+        // 권한 상승 여부와 무관하게 sftp_list_dir 호출 → 백엔드가 상승 시 root 채널로 라우팅
         if (!path) {
           try { path = await invoke('sftp_get_cwd', { id: tabId }); } catch {}
         }
         const files = await invoke('sftp_list_dir', { id: tabId, path: path || null });
+        clearTimeout(loadTimer);
         this.update(tabId, 'ssh', path || '/root', files);
       } else {
         const dir = path || (await getHomeDir());
         const files = await invoke('local_list_dir', { path: dir, showHidden: showHiddenFiles });
+        clearTimeout(loadTimer);
         this.update(tabId, 'local', dir, files);
       }
     } catch (e) {
+      clearTimeout(loadTimer);
+      if (this.els) this.els.list.innerHTML = `<div class="sidebar-empty">로드 실패: ${escapeHtml(String(e))}</div>`;
       console.log('파일 트리 로드 실패:', e);
     }
   },
@@ -781,53 +899,84 @@ const fileTreeView = {
     this.state.cwd = cwd;
     this.state.files = files;
 
-    const { cwdInput, hiddenBtn, list } = this.els;
-
+    const { cwdInput } = this.els;
     // 사용자가 입력 중이면 입력값을 덮어쓰지 않음
     if (!this.state.editing) {
       cwdInput.value = cwd;
       cwdInput.title = cwd;
     }
+    this._render();
+  },
+
+  // 정렬·필터 적용 후 목록 렌더 (재로드 없이 다시 그릴 때도 호출)
+  _render() {
+    if (!this.els) return;
+    const { hiddenBtn, list, summary } = this.els;
     hiddenBtn.classList.toggle('active', showHiddenFiles);
+    this._reflectElevation();
 
-    // 파일 목록 (이벤트 위임 → DocumentFragment)
-    list.innerHTML = '';
-    if (files.length === 0) {
-      list.innerHTML = '<div class="sidebar-empty">빈 디렉토리</div>';
-      return;
-    }
-    const frag = document.createDocumentFragment();
-    files.forEach((file, idx) => {
-      const el = document.createElement('div');
-      el.className = 'file-tree-item';
-      if (file.is_dir) el.classList.add('is-dir');
-      el.dataset.idx = idx;
-
-      const icon = document.createElement('span');
-      icon.className = 'file-tree-icon';
-      icon.textContent = file.is_dir ? '📁' : '📄';
-      el.appendChild(icon);
-
-      const name = document.createElement('span');
-      name.className = 'file-tree-name';
-      name.textContent = file.name;
-      el.appendChild(name);
-
-      if (!file.is_dir) {
-        const size = document.createElement('span');
-        size.className = 'file-tree-size';
-        size.textContent = formatSize(file.size);
-        el.appendChild(size);
-
-        const dl = document.createElement('button');
-        dl.className = 'file-tree-download';
-        dl.title = '다운로드';
-        dl.textContent = '↓';
-        el.appendChild(dl);
-      }
-      frag.appendChild(el);
+    const mode = SORT_MODES[this.state.sortIdx];
+    const filter = this.state.filter;
+    let items = this.state.files.slice();
+    if (filter) items = items.filter(f => f.name.toLowerCase().includes(filter));
+    items.sort((a, b) => {
+      if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
+      let r;
+      if (mode.key === 'size') r = (a.size || 0) - (b.size || 0);
+      else if (mode.key === 'mtime') r = (a.mtime || 0) - (b.mtime || 0);
+      else r = a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+      return r * mode.dir;
     });
-    list.appendChild(frag);
+    this._rendered = items;
+
+    list.innerHTML = '';
+    if (items.length === 0) {
+      list.innerHTML = this.state.files.length === 0
+        ? '<div class="sidebar-empty">빈 디렉토리</div>'
+        : '<div class="sidebar-empty">필터에 맞는 항목 없음</div>';
+    } else {
+      const frag = document.createDocumentFragment();
+      items.forEach((file, idx) => {
+        const el = document.createElement('div');
+        el.className = 'file-tree-item';
+        if (file.is_dir) el.classList.add('is-dir');
+        el.dataset.idx = idx;
+
+        const icon = document.createElement('span');
+        icon.className = 'file-tree-icon';
+        icon.textContent = file.is_dir ? '📁' : fileIcon(file.name);
+        el.appendChild(icon);
+
+        const name = document.createElement('span');
+        name.className = 'file-tree-name';
+        name.textContent = file.name;
+        el.appendChild(name);
+
+        const meta = document.createElement('span');
+        meta.className = 'file-tree-meta';
+        const t = relTime(file.mtime);
+        meta.textContent = file.is_dir ? t : [t, formatSize(file.size)].filter(Boolean).join(' · ');
+        el.appendChild(meta);
+
+        if (!file.is_dir) {
+          const dl = document.createElement('button');
+          dl.className = 'file-tree-download';
+          dl.title = '다운로드';
+          dl.textContent = '↓';
+          el.appendChild(dl);
+        }
+        frag.appendChild(el);
+      });
+      list.appendChild(frag);
+    }
+
+    // 하단 요약: 폴더/파일 개수 (+ 필터 시 표시)
+    const dirs = this.state.files.filter(f => f.is_dir).length;
+    const fs = this.state.files.length - dirs;
+    const shown = items.length;
+    summary.textContent = filter
+      ? `${shown}개 표시 · 전체 폴더 ${dirs} 파일 ${fs}`
+      : `폴더 ${dirs} · 파일 ${fs}`;
   },
 };
 
@@ -885,17 +1034,115 @@ async function uploadFile(tabId, localPath, remoteDirPath) {
   }
 }
 
+// ── 파일트리 권한 상승 (su/sudo → 전용 root 채널) ──
+// 계정 전환(su) 감지 시 root 비밀번호를 한 번 더 받아 백엔드에 전용 root 셸 채널을
+// 확립한다. 이후 파일트리 작업(sftp_*)은 백엔드가 그 채널로 투명하게 라우팅한다.
+// exit 시 자동 해제. (예전의 터미널-주입 방식은 전부 제거됨)
+
+let elevTabId = null;
+let elevMethod = 'su';
+
+function openElevationModal(tabId, method = 'su') {
+  const tab = tabs.find(t => t.id === tabId);
+  if (!tab || tab.type !== 'ssh') return;
+  elevTabId = tabId;
+  elevMethod = method;
+  const modal = document.getElementById('elev-modal');
+  if (!modal) return;
+  modal.querySelectorAll('.modal-auth-tab').forEach(t =>
+    t.classList.toggle('active', t.dataset.elev === method));
+  document.getElementById('elev-pw-label').textContent =
+    method === 'su' ? 'root 비밀번호' : 'sudo 비밀번호';
+  const pw = document.getElementById('elev-password');
+  pw.value = '';
+  modal.classList.remove('hidden');
+  setTimeout(() => pw.focus(), 50);
+}
+
+function closeElevationModal() {
+  const modal = document.getElementById('elev-modal');
+  if (modal) modal.classList.add('hidden');
+  const pw = document.getElementById('elev-password');
+  if (pw) pw.value = '';
+  elevTabId = null;
+}
+
+async function applyElevation() {
+  const tabId = elevTabId;
+  if (tabId == null) return;
+  const password = document.getElementById('elev-password').value;
+  const btn = document.getElementById('elev-modal-apply');
+  if (btn) { btn.disabled = true; btn.textContent = '연결 중…'; }
+  try {
+    const user = await invoke('sftp_set_elevation', { id: tabId, method: elevMethod, password });
+    const tab = tabs.find(t => t.id === tabId);
+    if (tab) { tab._elevated = true; tab._elevUser = user; }
+    closeElevationModal();
+    showToast(`🛡 ${user} 권한으로 파일트리 접근`);
+    fileTreeView._reflectElevation();
+    fileTreeView.load(tabId);
+  } catch (e) {
+    showToast(`권한 상승 실패: ${e}`, true);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '적용'; }
+  }
+}
+
+// 권한 상승 해제 + SFTP로 원복 (🛡 버튼으로 수동 호출)
+function dropElevation(tab) {
+  if (!tab || !tab._elevated) return;
+  invoke('sftp_clear_elevation', { id: tab.id }).catch(() => {});
+  tab._elevated = false;
+  tab._elevUser = null;
+  if (tab.id === activeTabId) {
+    fileTreeView._reflectElevation();
+    fileTreeView.load(tab.id);
+  }
+  showToast('권한 상승 해제 (로그인 계정)');
+}
+
+(() => {
+  const modal = document.getElementById('elev-modal');
+  if (!modal) return;
+  modal.querySelectorAll('.modal-auth-tab').forEach(t => {
+    t.addEventListener('click', () => {
+      elevMethod = t.dataset.elev;
+      modal.querySelectorAll('.modal-auth-tab').forEach(x => x.classList.toggle('active', x === t));
+      document.getElementById('elev-pw-label').textContent =
+        elevMethod === 'su' ? 'root 비밀번호' : 'sudo 비밀번호';
+    });
+  });
+  document.getElementById('elev-modal-close').addEventListener('click', closeElevationModal);
+  document.getElementById('elev-modal-cancel').addEventListener('click', closeElevationModal);
+  document.getElementById('elev-modal-apply').addEventListener('click', applyElevation);
+  document.getElementById('elev-password').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); applyElevation(); }
+    else if (e.key === 'Escape') { e.preventDefault(); closeElevationModal(); }
+  });
+})();
+
 // 토스트 알림
 function showToast(message, isError = false) {
+  let stack = document.getElementById('toast-stack');
+  if (!stack) {
+    stack = document.createElement('div');
+    stack.id = 'toast-stack';
+    document.body.appendChild(stack);
+  }
   const toast = document.createElement('div');
   toast.className = `toast ${isError ? 'toast-error' : 'toast-success'}`;
-  toast.textContent = message;
-  document.body.appendChild(toast);
-  setTimeout(() => toast.classList.add('show'), 10);
+  const icon = document.createElement('span');
+  icon.className = 'toast-icon';
+  icon.textContent = isError ? '✕' : '✓';
+  const text = document.createElement('span');
+  text.textContent = message;
+  toast.append(icon, text);
+  stack.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add('show'));
   setTimeout(() => {
     toast.classList.remove('show');
     setTimeout(() => toast.remove(), 300);
-  }, 3000);
+  }, isError ? 4500 : 2600);
 }
 
 // 잔상 숨김용 sentinel. 설정 주입 끝에 보이지 않는 OSC로 출력하고,
@@ -932,72 +1179,62 @@ function injectSshInit(id) {
 // su/sudo/중첩 셸 전환 감지 → OSC7 훅 재주입 (su 후에도 트리가 cd를 따라가게).
 // su - 는 새 로그인 셸이라 기존 훅이 사라지므로, 새 셸에 훅을 다시 심는다.
 // 같은 호스트 파일시스템을 공유하는 셸만 대상 (ssh/docker exec 등 다른 fs는 제외).
-const SHELL_SWITCH_RE = /[$#%]\s+(?:su\b|sudo\s+(?:-i|-s|su|bash|zsh|sh)\b|bash\b|zsh\b|dash\b|ksh\b)/;
+// 프롬프트 문자($ # % > ❯ ›)에 이어 나오는 셸 전환 명령 에코를 감지.
+const SHELL_SWITCH_RE = /[$#%>❯›]\s+(?:su\b|sudo\s+(?:-i|-s|su|bash|zsh|sh)\b|bash\b|zsh\b|dash\b|ksh\b)/;
+// 비밀번호 프롬프트(줄 끝) 감지 — 이 상태에선 어떤 주입도 금지
+const PW_PROMPT_RE = /(?:[Pp]assword|[Pp]assphrase|암호|비밀번호)\s*:?\s*$/;
+// 셸 프롬프트로 끝나는지 (로그인 완료 = 재주입 OK 시점 판정)
+const SHELL_PROMPT_END_RE = /[$#%>❯›]\s*$/;
+
+// ANSI/OSC 이스케이프 제거 (색깔 프롬프트 때문에 su 감지가 깨지는 것 방지)
+function stripAnsi(s) {
+  return s
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')   // CSI (색상 등)
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '') // OSC
+    .replace(/\x1b[()][A-Za-z0-9]/g, '');        // 문자셋 지정
+}
 
 function trackShellSwitch(tab, arr) {
   if (!tab || tab.type !== 'ssh') return;
-  let text = '';
-  for (let i = 0; i < arr.length; i++) text += String.fromCharCode(arr[i]);
+  let raw = '';
+  for (let i = 0; i < arr.length; i++) raw += String.fromCharCode(arr[i]);
+  const chunk = stripAnsi(raw);
 
-  // 셸 전환 명령 에코를 보면 재주입 대기 시작
-  if (SHELL_SWITCH_RE.test(text)) tab._reinjectPending = Date.now();
+  // 완성된 "줄" 단위로 su 전환을 감지한다 (타이핑 에코는 글자별로 쪼개져 오므로 줄 누적).
+  // 목적은 오직 하나: su 후 새 셸에 OSC7 훅을 다시 심어 cd 위치추적이 이어지게 하는 것.
+  // (권한 상승은 자동감지 없이 🛡 버튼 수동으로 처리한다)
+  tab._lineBuf = (tab._lineBuf || '') + chunk;
+  let idx;
+  while ((idx = tab._lineBuf.search(/[\r\n]/)) !== -1) {
+    const line = tab._lineBuf.slice(0, idx);
+    tab._lineBuf = tab._lineBuf.slice(idx + 1);
+    if (line && SHELL_SWITCH_RE.test(line)) tab._reinjectPending = Date.now();
+  }
+  if (tab._lineBuf.length > 600) tab._lineBuf = tab._lineBuf.slice(-600);
+
   if (!tab._reinjectPending) return;
 
-  // 20초 넘게 안 잠잠해지면 포기
-  if (Date.now() - tab._reinjectPending > 20000) {
+  // 30초 넘게 안 잠잠해지면 포기
+  if (Date.now() - tab._reinjectPending > 30000) {
     tab._reinjectPending = 0;
     clearTimeout(tab._reinjectTimer);
     return;
   }
-  // 비밀번호 프롬프트가 보이면 입력이 끝날 때까지 대기 (설정 명령이 비번으로 들어가는 사고 방지)
-  if (/[Pp]assword|[Pp]assphrase|암호/.test(text)) {
+  // 비밀번호 프롬프트로 끝나면 절대 주입 금지 (su 비번칸에 설정명령이 들어가면 인증이 깨진다)
+  if (PW_PROMPT_RE.test(tab._lineBuf)) {
     clearTimeout(tab._reinjectTimer);
     return;
   }
-  // 출력이 잠잠해지면(프롬프트 표시 완료) 훅 재주입
+  // 출력이 잠잠해지고 실제 셸 프롬프트가 떴을 때만 OSC7 훅 재주입 (비번 빨리 쳐도 안전)
   clearTimeout(tab._reinjectTimer);
   tab._reinjectTimer = setTimeout(() => {
-    if (tab._reinjectPending) {
-      tab._reinjectPending = 0;
-      injectSshInit(tab.id);
-    }
-  }, 900);
-}
-
-// SSH 터미널에서 pwd 실행 후 경로 반환
-function getPwdFromTerminal(tabId) {
-  return new Promise(async (resolve) => {
-    const buffer = [];
-    let done = false;
-
-    // pty-output 이벤트 임시 리스너
-    const unlisten = await listen('pty-output', (event) => {
-      if (event.payload.id !== tabId || done) return;
-      const text = new TextDecoder().decode(new Uint8Array(event.payload.data));
-      buffer.push(text);
-    });
-
-    // 특수 마커를 포함한 pwd 실행 (결과 파싱을 쉽게)
-    await invoke('pty_write', { id: tabId, data: '\x15echo "::TERMY_PWD::$(pwd)::TERMY_END::"\r' });
-
-    // 결과 대기
-    setTimeout(() => {
-      done = true;
-      unlisten();
-
-      const output = buffer.join('');
-      // 마커 사이의 경로 추출
-      const match = output.match(/::TERMY_PWD::(.+?)::TERMY_END::/);
-      if (match) {
-        resolve(match[1].trim());
-      } else {
-        // 마커 없으면 / 로 시작하는 줄 찾기
-        const lines = output.split(/[\r\n]+/).map(l => l.trim());
-        const path = lines.find(l => l.startsWith('/') && !l.includes(' ') && !l.includes('[') && !l.includes('echo'));
-        resolve(path || null);
-      }
-    }, 800);
-  });
+    if (!tab._reinjectPending) return;
+    const buf = tab._lineBuf || '';
+    if (PW_PROMPT_RE.test(buf)) return;              // 아직 비번칸 → 다음 출력에서 재시도
+    if (!SHELL_PROMPT_END_RE.test(buf)) return;      // 아직 셸 프롬프트 안 뜸 → 재시도
+    tab._reinjectPending = 0;
+    injectSshInit(tab.id);                           // OSC7 cd추적 훅 재주입
+  }, 1200);
 }
 
 function formatSize(bytes) {
@@ -1006,6 +1243,60 @@ function formatSize(bytes) {
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)}M`;
   return `${(bytes / 1024 / 1024 / 1024).toFixed(1)}G`;
 }
+
+// 확장자별 파일 아이콘
+const FILE_ICONS = {
+  js: '📜', ts: '📜', jsx: '📜', tsx: '📜', py: '🐍', rb: '💎', go: '🐹',
+  rs: '🦀', java: '☕', c: '📘', h: '📘', cpp: '📘', cc: '📘', cs: '📘',
+  php: '🐘', sh: '🐚', bash: '🐚', zsh: '🐚',
+  html: '🌐', htm: '🌐', css: '🎨', scss: '🎨',
+  json: '⚙️', yml: '⚙️', yaml: '⚙️', toml: '⚙️', xml: '⚙️', ini: '⚙️', conf: '⚙️', env: '⚙️',
+  md: '📝', txt: '📄', log: '📃', pdf: '📕',
+  png: '🖼', jpg: '🖼', jpeg: '🖼', gif: '🖼', svg: '🖼', webp: '🖼', ico: '🖼', bmp: '🖼',
+  zip: '📦', tar: '📦', gz: '📦', tgz: '📦', bz2: '📦', xz: '📦', rar: '📦', '7z': '📦',
+  mp3: '🎵', wav: '🎵', flac: '🎵', mp4: '🎬', mov: '🎬', avi: '🎬', mkv: '🎬',
+  sql: '🗃', db: '🗃', sqlite: '🗃',
+  lock: '🔒', pem: '🔑', key: '🔑', crt: '🔑', cert: '🔑',
+  exe: '⚡', bin: '⚡', so: '⚡', o: '⚡', a: '⚡',
+};
+
+function fileIcon(name) {
+  const dot = name.lastIndexOf('.');
+  if (dot > 0) {
+    const ext = name.slice(dot + 1).toLowerCase();
+    if (FILE_ICONS[ext]) return FILE_ICONS[ext];
+  }
+  if (/^\.?(dockerfile|makefile|readme|license)/i.test(name)) return '📋';
+  return '📄';
+}
+
+// 상대 시간 표시 (mtime: epoch 초)
+function relTime(sec) {
+  if (!sec) return '';
+  const now = Date.now() / 1000;
+  const d = now - sec;
+  if (d < 0) return '';
+  if (d < 60) return '방금';
+  if (d < 3600) return `${Math.floor(d / 60)}분 전`;
+  if (d < 86400) return `${Math.floor(d / 3600)}시간 전`;
+  if (d < 86400 * 7) return `${Math.floor(d / 86400)}일 전`;
+  const dt = new Date(sec * 1000);
+  const mo = String(dt.getMonth() + 1).padStart(2, '0');
+  const da = String(dt.getDate()).padStart(2, '0');
+  return dt.getFullYear() === new Date().getFullYear()
+    ? `${mo}/${da}`
+    : `${dt.getFullYear()}/${mo}`;
+}
+
+// 정렬 모드 (폴더는 항상 위)
+const SORT_MODES = [
+  { key: 'name', dir: 1, label: '이름↑' },
+  { key: 'name', dir: -1, label: '이름↓' },
+  { key: 'mtime', dir: -1, label: '날짜↓' },
+  { key: 'mtime', dir: 1, label: '날짜↑' },
+  { key: 'size', dir: -1, label: '크기↓' },
+  { key: 'size', dir: 1, label: '크기↑' },
+];
 
 function renderSessionList() {
   // 세션 패널 = 활성 탭의 파일 트리 표시 (이미 로드된 경우 재로드 안 함)
@@ -1097,6 +1388,7 @@ listen('pty-output', (event) => {
   const tab = tabs.find(t => t.id === id);
   if (!tab) return;
   const arr = new Uint8Array(data);
+
   // 접속 직후 설정 명령 잔상 숨김: sentinel을 볼 때까지 버퍼링 후 그 뒤만 출력
   if (tab._suppressing) {
     let s = '';
@@ -1157,8 +1449,10 @@ listen('pty-title', (event) => {
 listen('pty-cwd', (event) => {
   const { id, cwd } = event.payload;
   const tab = tabs.find(t => t.id === id);
+  if (!tab || tab.type !== 'ssh') return;
+
   // 활성 SSH 탭이고, 트리가 보고 있는 경로와 다를 때만 갱신 (엔터 연타 시 중복 요청 방지)
-  if (tab && tab.type === 'ssh' && id === activeTabId && fileTreeView.state.cwd !== cwd) {
+  if (id === activeTabId && fileTreeView.state.cwd !== cwd) {
     fileTreeView.load(id, cwd);
   }
 }).then(() => console.log('Listening for pty-cwd'));
@@ -1168,8 +1462,15 @@ listen('pty-reconnected', (event) => {
   const { id } = event.payload;
   const tab = tabs.find(t => t.id === id);
   if (tab && tab.type === 'ssh') {
+    // 재연결 시 새 로그인 셸이므로 권한 상승 상태 초기화 (백엔드 채널도 사라짐)
+    tab._elevated = false;
+    tab._elevUser = null;
+    tab.alive = true;
+    tab._connecting = false;
+    renderTabBar();
     injectSshInit(id);
     if (id === activeTabId) {
+      fileTreeView._reflectElevation();
       setTimeout(() => fileTreeView.load(id), 1500);
     }
   }
@@ -1230,6 +1531,10 @@ document.addEventListener('keydown', (e) => {
         e.preventDefault();
         navigateTab(1);
         break;
+      case '/':
+        e.preventDefault();
+        toggleShortcutsModal();
+        break;
     }
     // ⌘+/⌘- 폰트 크기
     if (e.key === '=' || e.key === '+') {
@@ -1264,6 +1569,21 @@ function navigateTab(direction) {
   const newIdx = (idx + direction + tabs.length) % tabs.length;
   switchTab(tabs[newIdx].id);
 }
+
+// 단축키 도움말 오버레이
+function toggleShortcutsModal() {
+  const m = document.getElementById('shortcuts-modal');
+  if (m) m.classList.toggle('hidden');
+}
+(() => {
+  const m = document.getElementById('shortcuts-modal');
+  if (!m) return;
+  document.getElementById('shortcuts-close').addEventListener('click', () => m.classList.add('hidden'));
+  m.addEventListener('click', (e) => { if (e.target === m) m.classList.add('hidden'); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !m.classList.contains('hidden')) m.classList.add('hidden');
+  });
+})();
 
 // ── 버튼 이벤트 ──
 
@@ -1803,6 +2123,7 @@ async function toggleSplit(direction = 'horizontal') {
   }, 100);
 
   const dirLabel = isHorizontal ? '좌우' : '상하';
+  updateSplitFocus();
   showToast(`${dirLabel} 분할됨 (⌘D 해제)`);
 }
 
@@ -2054,6 +2375,7 @@ function splitWithExisting(secondTabId, direction = 'horizontal') {
     secondTab.term.focus();
   }, 100);
 
+  updateSplitFocus();
   showToast(`${isHorizontal ? '좌우' : '상하'} 분할됨 (⌘D 해제)`);
 }
 
@@ -2065,6 +2387,16 @@ function focusSplitPane(side) {
     tab.term.focus();
     activeTabId = tabId;
     renderTabBar();
+    updateSplitFocus();
+  }
+}
+
+// 분할 중 활성 창에 테두리 하이라이트
+function updateSplitFocus() {
+  tabs.forEach(t => t.container && t.container.classList.remove('split-focused'));
+  if (splitState) {
+    const at = tabs.find(t => t.id === activeTabId);
+    if (at && at.container) at.container.classList.add('split-focused');
   }
 }
 
@@ -2101,6 +2433,7 @@ function unsplit() {
     }
   }, 50);
 
+  updateSplitFocus();
   showToast('분할 해제');
 }
 

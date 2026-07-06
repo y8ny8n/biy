@@ -15,3 +15,4 @@ termy-settings/.build/
 # IDE
 .vscode/
 .idea/
+.gstack/

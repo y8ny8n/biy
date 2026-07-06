@@ -1,7 +1,12 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
+
+/// 권한 상승 임시 파일 이름 충돌 방지용 시퀀스
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
@@ -29,10 +34,20 @@ enum SshOutcome {
     Disconnected(String),
 }
 
+/// 권한 상승 전용 셸 채널. su/sudo로 1회 인증한 뒤 상주하는 root 셸을 붙들고,
+/// 파일 작업 명령을 이 채널로만 실행한다. 사람이 쓰는 터미널과 완전히 분리돼 있고
+/// `stty -echo -onlcr tab0`로 에코·CRLF·탭확장을 꺼 파싱이 깨지지 않는다.
+struct ElevShell {
+    channel: ssh2::Channel,
+    user: String,
+}
+
 /// SFTP 핸들 (SSH 연결과 연동)
 struct SftpHandle {
     session: ssh2::Session,
     cwd: String,
+    /// None이면 로그인 유저(SFTP) 권한. Some이면 상주 root 셸로 파일 작업 수행.
+    elev: Option<ElevShell>,
 }
 
 /// PTY + SSH 입력 관리 (터미널 경로)
@@ -285,6 +300,7 @@ fn setup_sftp(id: u32, config: &SshConfig, sftp_state: &SftpState, app: &AppHand
                 sftps.insert(id, SftpHandle {
                     session: sftp_session,
                     cwd,
+                    elev: None,
                 });
             }
             log::info!("SFTP session created for tab {}", id);
@@ -812,6 +828,222 @@ struct FileEntry {
     is_dir: bool,
     size: u64,
     path: String,
+    /// 수정시각 (epoch 초). 정렬·표시용. 모르면 0.
+    mtime: u64,
+}
+
+// ── 권한 상승 (su/sudo) ──
+//
+// SFTP 서브시스템은 로그인 유저 권한으로만 동작한다. 터미널에서 su/sudo로 계정을
+// 전환해도 SFTP 채널 권한은 올라가지 않는다. 그래서 상승 모드에서는 SFTP 대신
+// SSH exec 채널에 su/sudo를 붙여 파일 작업을 수행한다.
+// - 목록: root로 `find` 실행 후 파싱
+// - 전송: /tmp에 임시 파일로 staging 후 root `cp`로 목적지에 반영 (바이너리 안전 + 진행률 유지)
+// - 삭제/이름변경: root `rm`/`mv`
+
+/// 셸 인용: 작은따옴표로 감싸고 내부 작은따옴표만 이스케이프한다.
+fn shq(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// 채널에서 특정 문자열(needles 중 하나)이 나타날 때까지 읽는다. (셸 프롬프트/비번프롬프트 대기용)
+fn read_until_str(ch: &mut ssh2::Channel, needles: &[&str], deadline: Instant) -> Result<String, String> {
+    let mut acc = String::new();
+    let mut buf = [0u8; 2048];
+    loop {
+        match ch.read(&mut buf) {
+            Ok(0) => return Err("채널이 종료됨".to_string()),
+            Ok(n) => {
+                acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if needles.iter().any(|s| acc.contains(s)) {
+                    return Ok(acc);
+                }
+            }
+            Err(_) => {
+                if Instant::now() > deadline {
+                    return Err(format!("응답 대기 시간 초과: …{}", acc.chars().rev().take(60).collect::<String>().chars().rev().collect::<String>()));
+                }
+            }
+        }
+        if Instant::now() > deadline {
+            return Err("응답 대기 시간 초과".to_string());
+        }
+    }
+}
+
+/// 채널에서 특정 바이트가 나타날 때까지 읽어 누적 버퍼를 반환한다.
+fn read_until_byte(ch: &mut ssh2::Channel, end: u8, deadline: Instant) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match ch.read(&mut buf) {
+            Ok(0) => return Err("채널이 종료됨".to_string()),
+            Ok(n) => {
+                out.extend_from_slice(&buf[..n]);
+                if out.contains(&end) {
+                    return Ok(out);
+                }
+            }
+            Err(_) => {
+                if Instant::now() > deadline {
+                    return Err("명령 응답 시간 초과".to_string());
+                }
+            }
+        }
+        if Instant::now() > deadline {
+            return Err("명령 응답 시간 초과".to_string());
+        }
+    }
+}
+
+/// su/sudo로 1회 인증해 상주 root 셸 채널을 만든다.
+/// PTY를 열고 셸을 띄운 뒤 su/sudo → 비번 → stty로 에코/CRLF/탭확장을 끄고,
+/// 마커로 감싼 `id -un`으로 root 여부를 검증한다.
+fn establish_elev(session: &ssh2::Session, method: &str, password: &str) -> Result<ElevShell, String> {
+    session.set_blocking(true);
+    session.set_timeout(15_000);
+
+    let mut ch = session.channel_session().map_err(|e| e.to_string())?;
+    ch.request_pty("dumb", None, Some((400, 80, 0, 0))).map_err(|e| e.to_string())?;
+    ch.shell().map_err(|e| e.to_string())?;
+
+    let deadline = Instant::now() + Duration::from_secs(12);
+
+    // 권한 상승 명령
+    let elevate = match method {
+        "su" => "su - root\n",
+        "sudo" => "sudo -i\n",
+        _ => return Err("알 수 없는 권한 상승 방식".to_string()),
+    };
+    ch.write_all(elevate.as_bytes()).map_err(|e| e.to_string())?;
+    let _ = ch.flush();
+
+    // 비밀번호 프롬프트 대기 → 비번 전송. 프롬프트 자체가 안 오면 원인별 안내.
+    let prompt = read_until_str(&mut ch, &["assword", "암호", "비밀번호"], deadline)
+        .map_err(|_| "비밀번호 프롬프트가 오지 않았습니다 (sudo 미허용/셸 문제일 수 있어요)".to_string())?;
+    // sudo인데 sudoers에 없으면 프롬프트 대신 오류가 옴
+    if method == "sudo" && (prompt.contains("not allowed") || prompt.contains("not in the sudoers")) {
+        return Err("sudo 권한이 없는 계정입니다 (su 방식으로 시도해보세요)".to_string());
+    }
+    ch.write_all(format!("{}\n", password).as_bytes()).map_err(|e| e.to_string())?;
+    let _ = ch.flush();
+
+    // 하드닝(에코/CRLF/탭확장 off) + 프롬프트 제거 + 마커로 감싼 유저 확인
+    let init = "stty -echo -onlcr tab0 2>/dev/null; unset PROMPT_COMMAND 2>/dev/null; PS1=''; printf '\\001U:'; id -un 2>/dev/null; printf '\\002'\n";
+    ch.write_all(init.as_bytes()).map_err(|e| e.to_string())?;
+    let _ = ch.flush();
+
+    let raw = read_until_byte(&mut ch, 0x02, Instant::now() + Duration::from_secs(10))
+        .map_err(|_| "응답이 없습니다 (비밀번호가 틀렸거나 인증에 실패했습니다)".to_string())?;
+    let s = String::from_utf8_lossy(&raw);
+    // 실제 출력의 마커(바이트 0x01 + "U:")만 잡는다 (명령 에코엔 리터럴 백슬래시라 안 걸림)
+    let user = s
+        .split('\u{1}')
+        .find_map(|seg| seg.strip_prefix("U:"))
+        .and_then(|r| r.split('\u{2}').next())
+        .map(|u| u.trim().to_string())
+        .unwrap_or_default();
+
+    if user.is_empty() {
+        return Err("인증 실패 — 비밀번호를 확인하세요".to_string());
+    }
+    if user != "root" {
+        return Err(format!("root가 아닌 '{}'로 전환됨 (예상과 다름)", user));
+    }
+    Ok(ElevShell { channel: ch, user })
+}
+
+/// 상주 셸에 명령을 실행하고 stdout 바이트를 반환한다.
+/// stty로 에코/CRLF/탭이 꺼져 있어 마커 사이 출력이 곧 순수 결과다.
+fn elev_run(shell: &mut ElevShell, cmd: &str) -> Result<Vec<u8>, String> {
+    let wrapped = format!("printf '\\001'; {{ {} ; }} 2>/dev/null; printf '\\002%s\\003' \"$?\"\n", cmd);
+    shell.channel.write_all(wrapped.as_bytes()).map_err(|e| e.to_string())?;
+    let _ = shell.channel.flush();
+    let raw = read_until_byte(&mut shell.channel, 0x03, Instant::now() + Duration::from_secs(30))?;
+    let i1 = raw.iter().position(|&b| b == 1);
+    let i2 = raw.iter().position(|&b| b == 2);
+    let i3 = raw.iter().position(|&b| b == 3);
+    match (i1, i2, i3) {
+        (Some(a), Some(b), Some(c)) if a < b && b < c => Ok(raw[a + 1..b].to_vec()),
+        _ => Err("권한 채널 응답 파싱 실패".to_string()),
+    }
+}
+
+/// 핸들의 상주 셸로 명령 실행 (세션 blocking 설정 후 elev_run).
+fn handle_elev_run(h: &mut SftpHandle, cmd: &str) -> Result<Vec<u8>, String> {
+    h.session.set_blocking(true);
+    h.session.set_timeout(30_000);
+    let shell = h.elev.as_mut().ok_or("권한 채널 없음")?;
+    elev_run(shell, cmd)
+}
+
+/// `find -printf '%Y %s %T@ %p\n'` 출력을 FileEntry 목록으로 파싱한다.
+/// 탭 대신 공백+전체경로(%p)라 PTY 탭확장/경로 내 공백에도 안전.
+fn parse_find_output(out: &[u8], dir: &str) -> Vec<FileEntry> {
+    let text = String::from_utf8_lossy(out);
+    let base = dir.trim_end_matches('/');
+    let mut files: Vec<FileEntry> = text
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_end_matches('\r');
+            if line.is_empty() {
+                return None;
+            }
+            // "<type> <size> <mtime> <fullpath>"
+            let mut it = line.splitn(4, ' ');
+            let ty = it.next()?;
+            let sz = it.next()?;
+            let mt = it.next()?;
+            let full = it.next()?;
+            let name = full.rsplit('/').next().unwrap_or(full);
+            if name.is_empty() || name == "." || name == ".." {
+                return None;
+            }
+            Some(FileEntry {
+                is_dir: ty == "d",
+                size: sz.parse().unwrap_or(0),
+                mtime: mt.split('.').next().and_then(|s| s.parse().ok()).unwrap_or(0),
+                path: format!("{}/{}", base, name),
+                name: name.to_string(),
+            })
+        })
+        .collect();
+    files.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    files
+}
+
+/// 파일트리 권한 상승: su/sudo로 상주 root 셸을 확립하고 유효 유저명을 반환한다.
+#[tauri::command]
+fn sftp_set_elevation(
+    id: u32,
+    method: String,
+    password: String,
+    sftp_state: State<'_, SftpState>,
+) -> Result<String, String> {
+    let mut sftps = sftp_state.lock().map_err(|e| e.to_string())?;
+    let h = sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
+    let shell = establish_elev(&h.session, &method, &password)?;
+    let user = shell.user.clone();
+    h.elev = Some(shell);
+    h.session.set_blocking(false);
+    Ok(user)
+}
+
+/// 파일트리 권한 상승 해제 (상주 셸 채널 닫기).
+#[tauri::command]
+fn sftp_clear_elevation(id: u32, sftp_state: State<'_, SftpState>) -> Result<(), String> {
+    let mut sftps = sftp_state.lock().map_err(|e| e.to_string())?;
+    if let Some(h) = sftps.get_mut(&id) {
+        if let Some(mut shell) = h.elev.take() {
+            let _ = shell.channel.write_all(b"exit\n");
+            let _ = shell.channel.close();
+        }
+    }
+    Ok(())
 }
 
 /// SFTP 디렉토리 목록
@@ -823,6 +1055,20 @@ fn sftp_list_dir(id: u32, path: Option<String>, sftp_state: State<'_, SftpState>
     sftp_handle.session.set_timeout(30_000);
     sftp_handle.session.set_blocking(true);
     let dir_path = path.unwrap_or_else(|| sftp_handle.cwd.clone());
+
+    // 권한 상승 모드: SFTP 대신 상주 root 셸로 find 실행
+    if sftp_handle.elev.is_some() {
+        let cmd = format!(
+            "find {} -mindepth 1 -maxdepth 1 -printf '%Y %s %T@ %p\\n'",
+            shq(&dir_path)
+        );
+        let r = handle_elev_run(sftp_handle, &cmd);
+        sftp_handle.session.set_blocking(false);
+        let out = r?;
+        sftp_handle.cwd = dir_path.clone();
+        return Ok(parse_find_output(&out, &dir_path));
+    }
+
     let sftp = sftp_handle.session.sftp().map_err(|e| e.to_string())?;
 
     let entries = sftp.readdir(std::path::Path::new(&dir_path))
@@ -836,6 +1082,7 @@ fn sftp_list_dir(id: u32, path: Option<String>, sftp_state: State<'_, SftpState>
             Some(FileEntry {
                 is_dir: stat.is_dir(),
                 size: stat.size.unwrap_or(0),
+                mtime: stat.mtime.unwrap_or(0),
                 path: path_buf.to_string_lossy().to_string(),
                 name,
             })
@@ -914,13 +1161,27 @@ fn sftp_download(id: u32, remote_path: String, local_path: String, sftp_state: S
 
             sftp_handle.session.set_timeout(60_000);
             sftp_handle.session.set_blocking(true);
+
+            // 권한 상승 모드: root로 임시 파일에 복사(+세계 읽기 권한) 후 그 파일을 내려받는다
+            let elevated = sftp_handle.elev.is_some();
+            let (open_path, staged_tmp) = if elevated {
+                let tmp = format!("/tmp/.termy-dl-{}-{}", id, TMP_SEQ.fetch_add(1, Ordering::Relaxed));
+                handle_elev_run(sftp_handle, &format!(
+                    "cp -f -- {src} {tmp} && chmod 644 -- {tmp}",
+                    src = shq(&remote_path), tmp = shq(&tmp)
+                ))?;
+                (tmp.clone(), Some(tmp))
+            } else {
+                (remote_path.clone(), None)
+            };
+
             let transfer_result = (|| -> Result<(), String> {
                 let sftp = sftp_handle.session.sftp().map_err(|e| e.to_string())?;
 
-                let stat = sftp.stat(std::path::Path::new(&remote_path)).map_err(|e| e.to_string())?;
+                let stat = sftp.stat(std::path::Path::new(&open_path)).map_err(|e| e.to_string())?;
                 let total_size = stat.size.unwrap_or(0);
 
-                let mut remote_file = sftp.open(std::path::Path::new(&remote_path))
+                let mut remote_file = sftp.open(std::path::Path::new(&open_path))
                     .map_err(|e| format!("파일 열기 실패: {}", e))?;
 
                 let mut local_file = std::fs::File::create(&local_path).map_err(|e| e.to_string())?;
@@ -952,6 +1213,10 @@ fn sftp_download(id: u32, remote_path: String, local_path: String, sftp_state: S
 
                 Ok(())
             })();
+            // 권한 상승 임시 파일 정리
+            if let Some(tmp) = staged_tmp.as_ref() {
+                let _ = handle_elev_run(sftp_handle, &format!("rm -f -- {}", shq(tmp)));
+            }
             sftp_handle.session.set_blocking(false);
             transfer_result
         })();
@@ -1000,10 +1265,20 @@ fn sftp_upload(id: u32, local_path: String, remote_path: String, sftp_state: Sta
 
             sftp_handle.session.set_timeout(60_000);
             sftp_handle.session.set_blocking(true);
+
+            // 권한 상승 모드: 로그인 유저가 쓸 수 있는 /tmp에 먼저 올린 뒤 root로 목적지에 복사
+            let elevated = sftp_handle.elev.is_some();
+            let (write_path, staged_tmp) = if elevated {
+                let tmp = format!("/tmp/.termy-ul-{}-{}", id, TMP_SEQ.fetch_add(1, Ordering::Relaxed));
+                (tmp.clone(), Some(tmp))
+            } else {
+                (remote_path.clone(), None)
+            };
+
             let transfer_result = (|| -> Result<(), String> {
                 let sftp = sftp_handle.session.sftp().map_err(|e| e.to_string())?;
 
-                let mut remote_file = sftp.create(std::path::Path::new(&remote_path))
+                let mut remote_file = sftp.create(std::path::Path::new(&write_path))
                     .map_err(|e| format!("파일 생성 실패: {}", e))?;
 
                 let mut uploaded: u64 = 0;
@@ -1021,17 +1296,34 @@ fn sftp_upload(id: u32, local_path: String, remote_path: String, sftp_state: Sta
                         "total": total_size,
                     }));
                 }
+                Ok(())
+            })();
 
+            // 권한 상승: 임시 → 실제 목적지로 복사 후 임시 삭제
+            let final_result = match staged_tmp.as_ref() {
+                Some(tmp) => match transfer_result {
+                    Ok(()) => handle_elev_run(sftp_handle, &format!(
+                        "cp -f -- {tmp} {dst} && rm -f -- {tmp}",
+                        tmp = shq(tmp), dst = shq(&remote_path)
+                    )).map(|_| ()),
+                    Err(err) => {
+                        let _ = handle_elev_run(sftp_handle, &format!("rm -f -- {}", shq(tmp)));
+                        Err(err)
+                    }
+                },
+                _ => transfer_result,
+            };
+
+            if final_result.is_ok() {
                 let _ = app_clone.emit("transfer-complete", serde_json::json!({
                     "type": "upload",
                     "tabId": id,
                     "name": file_name,
                 }));
+            }
 
-                Ok(())
-            })();
             sftp_handle.session.set_blocking(false);
-            transfer_result
+            final_result
         })();
 
         if let Err(e) = result {
@@ -1100,10 +1392,17 @@ fn local_list_dir(path: String, show_hidden: Option<bool>) -> Result<Vec<FileEnt
             let name = entry.file_name().to_string_lossy().to_string();
             if !show_hidden && name.starts_with('.') { return None; }
             let metadata = entry.metadata().ok()?;
+            let mtime = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             Some(FileEntry {
                 name,
                 is_dir: metadata.is_dir(),
                 size: metadata.len(),
+                mtime,
                 path: entry.path().to_string_lossy().to_string(),
             })
         })
@@ -1136,6 +1435,19 @@ fn sftp_delete(id: u32, remote_path: String, is_dir: bool, sftp_state: State<'_,
     let sftp_handle = sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
     sftp_handle.session.set_timeout(30_000);
     sftp_handle.session.set_blocking(true);
+
+    // 권한 상승 모드: 상주 root 셸로 rm 실행
+    if sftp_handle.elev.is_some() {
+        let cmd = if is_dir {
+            format!("rm -rf -- {}", shq(&remote_path))
+        } else {
+            format!("rm -f -- {}", shq(&remote_path))
+        };
+        let r = handle_elev_run(sftp_handle, &cmd);
+        sftp_handle.session.set_blocking(false);
+        return r.map(|_| ());
+    }
+
     let result = (|| -> Result<(), String> {
         let sftp = sftp_handle.session.sftp().map_err(|e| e.to_string())?;
         let path = std::path::Path::new(&remote_path);
@@ -1157,6 +1469,15 @@ fn sftp_rename(id: u32, old_path: String, new_path: String, sftp_state: State<'_
     let sftp_handle = sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
     sftp_handle.session.set_timeout(30_000);
     sftp_handle.session.set_blocking(true);
+
+    // 권한 상승 모드: 상주 root 셸로 mv 실행
+    if sftp_handle.elev.is_some() {
+        let cmd = format!("mv -f -- {} {}", shq(&old_path), shq(&new_path));
+        let r = handle_elev_run(sftp_handle, &cmd);
+        sftp_handle.session.set_blocking(false);
+        return r.map(|_| ());
+    }
+
     let result = (|| -> Result<(), String> {
         let sftp = sftp_handle.session.sftp().map_err(|e| e.to_string())?;
         sftp.rename(std::path::Path::new(&old_path), std::path::Path::new(&new_path), None)
@@ -1178,18 +1499,39 @@ fn sftp_read_to_local(
     let h = sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
     h.session.set_timeout(60_000);
     h.session.set_blocking(true);
-    let r = (|| -> Result<(), String> {
+    let elevated = h.elev.is_some();
+
+    // 권한 상승 모드: root로 임시 파일에 복사 후 그 파일을 읽는다
+    let open_path = if elevated {
+        let tmp = format!("/tmp/.termy-ed-{}-{}", id, TMP_SEQ.fetch_add(1, Ordering::Relaxed));
+        if let Err(e) = handle_elev_run(h, &format!(
+            "cp -f -- {src} {tmp} && chmod 644 -- {tmp}",
+            src = shq(remote_path), tmp = shq(&tmp)
+        )) {
+            h.session.set_blocking(false);
+            return Err(e);
+        }
+        tmp
+    } else {
+        remote_path.to_string()
+    };
+
+    let read_result = (|| -> Result<(), String> {
         let sftp = h.session.sftp().map_err(|e| e.to_string())?;
         let mut rf = sftp
-            .open(std::path::Path::new(remote_path))
+            .open(std::path::Path::new(&open_path))
             .map_err(|e| format!("원격 파일 열기 실패: {}", e))?;
         let mut buf = Vec::new();
         rf.read_to_end(&mut buf).map_err(|e| e.to_string())?;
         std::fs::write(local_path, &buf).map_err(|e| e.to_string())?;
         Ok(())
     })();
+
+    if elevated {
+        let _ = handle_elev_run(h, &format!("rm -f -- {}", shq(&open_path)));
+    }
     h.session.set_blocking(false);
-    r
+    read_result
 }
 
 /// 로컬 파일 → 원격 경로로 쓰기 (편집 자동 동기화용)
@@ -1204,16 +1546,33 @@ fn sftp_write_from_local(
     let h = sftps.get_mut(&id).ok_or("SFTP 연결 없음")?;
     h.session.set_timeout(60_000);
     h.session.set_blocking(true);
-    let r = (|| -> Result<(), String> {
+    let elevated = h.elev.is_some();
+
+    // 권한 상승 모드: /tmp에 쓴 뒤 root로 목적지에 복사
+    let write_path = if elevated {
+        format!("/tmp/.termy-ed-{}-{}", id, TMP_SEQ.fetch_add(1, Ordering::Relaxed))
+    } else {
+        remote_path.to_string()
+    };
+
+    let write_result = (|| -> Result<(), String> {
         let sftp = h.session.sftp().map_err(|e| e.to_string())?;
         let mut wf = sftp
-            .create(std::path::Path::new(remote_path))
+            .create(std::path::Path::new(&write_path))
             .map_err(|e| format!("원격 파일 생성 실패: {}", e))?;
         wf.write_all(&contents).map_err(|e| e.to_string())?;
         Ok(())
     })();
+
+    let result = match write_result {
+        Ok(()) if elevated => handle_elev_run(h, &format!(
+            "cp -f -- {tmp} {dst} && rm -f -- {tmp}",
+            tmp = shq(&write_path), dst = shq(remote_path)
+        )).map(|_| ()),
+        other => other,
+    };
     h.session.set_blocking(false);
-    r
+    result
 }
 
 /// 원격 파일을 로컬 에디터(Sublime Text)로 열고, 저장될 때마다 서버에 자동 업로드.
@@ -1447,6 +1806,8 @@ pub fn run() {
             sftp_list_dir,
             sftp_get_cwd,
             sftp_sync_cwd,
+            sftp_set_elevation,
+            sftp_clear_elevation,
             sftp_download,
             sftp_upload,
             sftp_edit,
